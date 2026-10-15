@@ -558,7 +558,7 @@ public class Menu {
         switchR.setPadding(10, 5, 0, 5);
         boolean isChecked = Preferences.loadPrefBool(featName, featNum, swiOn);
         switchR.setChecked(isChecked);
-        if (featNum == 0 && floatingHUD != null) {
+        if ((featNum == 0 || featName.contains("Floating Note HUD")) && floatingHUD != null) {
             if (isChecked) {
                 floatingHUD.show();
             } else {
@@ -568,13 +568,11 @@ public class Menu {
         switchR.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             public void onCheckedChanged(CompoundButton compoundButton, boolean bool) {
                 Preferences.changeFeatureBool(featName, featNum, bool);
+                if ((featNum == 0 || featName.contains("Floating Note HUD")) && floatingHUD != null) {
+                    if (bool) floatingHUD.show();
+                    else floatingHUD.hide();
+                }
                 switch (featNum) {
-                    case 0:
-                        if (floatingHUD != null) {
-                            if (bool) floatingHUD.show();
-                            else floatingHUD.hide();
-                        }
-                        break;
                     case -1: //Save perferences
                         Preferences.with(switchR.getContext()).writeBoolean(-1, bool);
                         if (bool == false)

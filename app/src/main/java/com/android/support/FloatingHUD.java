@@ -114,7 +114,7 @@ public class FloatingHUD {
         header.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView tvTitle = new TextView(mContext);
+        tvTitle = new TextView(mContext);
         tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font></b>"));
         tvTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         tvTitle.setTypeface(Typeface.DEFAULT_BOLD);
@@ -261,6 +261,10 @@ public class FloatingHUD {
         };
     }
 
+    private TextView tvTitle;
+    private int pAuto = -1;
+    private int pAutoMaster = -1;
+
     private void initUpdater() {
         mHandler = new Handler(Looper.getMainLooper());
         mUpdateRunnable = new Runnable() {
@@ -277,8 +281,10 @@ public class FloatingHUD {
                             int orange = stats[4];
                             int total = stats[5];
                             int miss = stats[6];
+                            int autoHits = stats.length >= 9 ? stats[8] : 0;
+                            int autoMaster = stats.length >= 10 ? stats[9] : 0;
 
-                            updateCounts(green, red, yellow, blue, orange, total, miss);
+                            updateCounts(green, red, yellow, blue, orange, total, miss, autoHits, autoMaster);
                         }
                     } catch (Throwable t) {
                         log("Error updating stats: " + t.getMessage());
@@ -290,10 +296,11 @@ public class FloatingHUD {
         mHandler.post(mUpdateRunnable);
     }
 
-    public void updateCounts(int green, int red, int yellow, int blue, int orange, int total, int miss) {
+    public void updateCounts(int green, int red, int yellow, int blue, int orange, int total, int miss, int autoHits, int autoMaster) {
         // Only redraw if any number changed
         if (green == pGreen && red == pRed && yellow == pYellow &&
-                blue == pBlue && orange == pOrange && total == pTotal && miss == pMiss) {
+                blue == pBlue && orange == pOrange && total == pTotal &&
+                miss == pMiss && autoHits == pAuto && autoMaster == pAutoMaster) {
             return;
         }
 
@@ -304,6 +311,8 @@ public class FloatingHUD {
         pOrange = orange;
         pTotal = total;
         pMiss = miss;
+        pAuto = autoHits;
+        pAutoMaster = autoMaster;
 
         tvGreen.setText("🟢 G: " + green);
         tvRed.setText("🔴 R: " + red);
@@ -312,7 +321,19 @@ public class FloatingHUD {
         tvOrange.setText("🟠 O: " + orange);
         tvMiss.setText(Html.fromHtml("❌ Miss: <b>" + miss + "</b>"));
 
-        tvTotal.setText(Html.fromHtml("🎯 Hit: <b><font color='#00E5FF'>" + total + "</font></b>"));
+        if (autoHits > 0) {
+            tvTotal.setText(Html.fromHtml("🎯 Hit: <b><font color='#00E5FF'>" + total + "</font></b> <small><font color='#76FF03'>(" + autoHits + " auto)</font></small>"));
+        } else {
+            tvTotal.setText(Html.fromHtml("🎯 Hit: <b><font color='#00E5FF'>" + total + "</font></b>"));
+        }
+
+        if (tvTitle != null) {
+            if (autoMaster == 1) {
+                tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font> <font color='#00E676'><small>[AUTO]</small></font></b>"));
+            } else {
+                tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font></b>"));
+            }
+        }
 
         int allPlayed = total + miss;
         if (allPlayed > 0) {
