@@ -238,6 +238,21 @@ struct Vector3 {
 static void *(*Component_get_transform)(void *component) = nullptr;
 static Vector3 (*Transform_get_position)(void *transform) = nullptr;
 
+// Function pointers for fret fire particle burst & Unity ParticleSystem
+static void *(*Main_Frets_byh)(void *instance, int32_t fret) = nullptr;
+static void (*ParticleSystem_Play)(void *instance, void *dummy) = nullptr;
+
+// Helper to trigger the fire particle burst on a fret circle
+static void TriggerFretFireEffect(int32_t fret) {
+    if (fret < 0 || fret >= 5) return;
+    if (Main_Frets_byh != nullptr && ParticleSystem_Play != nullptr && mainFretsInstance != nullptr) {
+        void *ps = Main_Frets_byh(mainFretsInstance, fret);
+        if (ps != nullptr) {
+            ParticleSystem_Play(ps, nullptr);
+        }
+    }
+}
+
 // Forward declaration of visual fret function pointer
 void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr;
 
@@ -315,6 +330,7 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
 
                 int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
                 if (fret >= 0 && fret < 5) {
+                    TriggerFretFireEffect(fret);
                     if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                         old_Main_Frets_byc(mainFretsInstance, fret, true);
                         g_fretVisualTimer[fret] = 4;
@@ -455,13 +471,15 @@ void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
             Vector3 pos = Transform_get_position(transform);
 
             // In Guitar Flash:
-            // Color circle target line starts visually when note enters pos.z <= -12.0f.
-            // Circle center is at Z ≈ -13.05f.
-            // Miss boundary is at Z = -15.5f.
-            // Covering [-12.0f, -15.8f] ensures 100% frame coverage even at extreme note speeds in Hard mode!
-            if (pos.z <= -12.0f && pos.z >= -15.8f) {
+            // Center of the color circle is at Z ≈ -13.05f.
+            // When pos.z <= -12.7f, the note is visually inside the color circle!
+            // Hits at Z ∈ [-12.7f, -15.5f] look completely natural, legit, and centered.
+            if (pos.z <= -12.7f && pos.z >= -15.5f) {
                 // Execute Perfect hit directly on note
                 hook_Main_Notes_byy(instance, hm, time);
+
+                // Trigger FIRE particle burst on the fret circle!
+                TriggerFretFireEffect(fret);
 
                 // Animate visual fret press
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
@@ -555,6 +573,19 @@ void hook_Main_Update(void *instance) {
     }
 }
 
+// 10. Hook Main_Sounds::cfe (RVA: 0x20e267c)
+// Plays the screech / clack strum error sound effect
+void (*old_Main_Sounds_cfe)(void *instance) = nullptr;
+void hook_Main_Sounds_cfe(void *instance) {
+    if (g_autoPlay.load()) {
+        // Mute miss / strum error sound during Auto Play for a clean, legit audio experience!
+        return;
+    }
+    if (old_Main_Sounds_cfe != nullptr) {
+        old_Main_Sounds_cfe(instance);
+    }
+}
+
 // Native Thread for Library Detection & Hooking
 void *hack_thread(void *) {
     LogDebug("=== Guitar Hero Mod Menu Native Thread Started ===");
@@ -577,6 +608,10 @@ void *hack_thread(void *) {
     // Resolve Unity Component & Transform methods
     Component_get_transform = reinterpret_cast<void *(*)(void *)>(base + 0x3cac2f4);
     Transform_get_position = reinterpret_cast<Vector3 (*)(void *)>(base + 0x3cbd5c0);
+
+    // Resolve Fret Fire Particle Effect & Unity ParticleSystem methods
+    Main_Frets_byh = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1f9d290);
+    ParticleSystem_Play = reinterpret_cast<void (*)(void *, void *)>(base + 0x3d05c0c);
 
     // 1. Hook Main_Scorer::cdc (0x20c38a0)
     HOOK("0x20c38a0", hook_Main_Scorer_cdc, old_Main_Scorer_cdc);
@@ -613,6 +648,10 @@ void *hack_thread(void *) {
     // 9. Hook Main::Update (0x20c50b0)
     HOOK("0x20c50b0", hook_Main_Update, old_Main_Update);
     LogDebug("Hook Main::Update (0x20c50b0): %s", old_Main_Update != nullptr ? "SUCCESS" : "FAILED");
+
+    // 10. Hook Main_Sounds::cfe (0x20e267c) - Mute miss/strum error sound during Auto Play
+    HOOK("0x20e267c", hook_Main_Sounds_cfe, old_Main_Sounds_cfe);
+    LogDebug("Hook Main_Sounds::cfe (0x20e267c): %s", old_Main_Sounds_cfe != nullptr ? "SUCCESS" : "FAILED");
 
     LogDebug("All Guitar Hero Real-Time & Auto Play hooks installed successfully!");
 
