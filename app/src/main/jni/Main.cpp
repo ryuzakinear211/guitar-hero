@@ -108,24 +108,15 @@ static void LogMissThrottled(int fret, int totalMiss, int perdidas, int erradas)
 }
 
 // =========================================================================
-// Real-Time Note Counter & Auto Hit (Smart Move) State
+// Real-Time Note Counter & Auto Play State
 // =========================================================================
-static bool featureFloatingHUD = true;      // Default ON: display Floating HUD panel
-static bool featureIncludeErradas = true;   // Default ON: count fret/strum errors as Miss
+static bool featureFloatingHUD = false;     // Default OFF
+static bool featureIncludeErradas = false;  // Default OFF
 
-// Auto Hit (Smart Move) Settings
-static std::atomic<bool> g_autoMaster{true};       // Master switch for Auto Hit
-static std::atomic<bool> g_autoGreen{true};        // Auto Green note (Fret 0)
-static std::atomic<bool> g_autoRed{true};          // Auto Red note (Fret 1)
-static std::atomic<bool> g_autoYellow{true};       // Auto Yellow note (Fret 2)
-static std::atomic<bool> g_autoBlue{true};         // Auto Blue note (Fret 3)
-static std::atomic<bool> g_autoOrange{true};       // Auto Orange note (Fret 4)
-static std::atomic<int> g_autoTimingMode{0};       // 0 = 100% Perfect, 1 = Humanized (Legit), 2 = Instant
-static std::atomic<bool> g_autoVisualFret{true};    // Animate visual fret buttons on screen
-static std::atomic<bool> g_autoSustain{true};       // Automatically hold sustain/rastro notes
+// Auto Play Settings (Single Toggle, OFF by default)
+static std::atomic<bool> g_autoPlay{false};       // Master switch for Auto Play
 
 // Per-fret internal trackers (frets 0..4)
-static std::atomic<int> g_fretWindowFrames[5]{0, 0, 0, 0, 0};
 static std::atomic<int> g_fretVisualTimer[5]{0, 0, 0, 0, 0};
 static std::atomic<bool> g_fretSustaining[5]{false, false, false, false, false};
 static std::atomic<int32_t> g_autoHitsCount[5]{0, 0, 0, 0, 0};
@@ -136,18 +127,6 @@ static void *mainInstance = nullptr;        // Pointer to Main (MonoBehaviour)
 static void *mainNotesInstance = nullptr;   // Pointer to Main_Notes
 static void *mainScorerInstance = nullptr;  // Pointer to Main_Scorer
 static void *mainFretsInstance = nullptr;   // Pointer to Main_Frets
-
-static inline bool isColorFretAutoEnabled(int fret) {
-    if (!g_autoMaster.load()) return false;
-    switch (fret) {
-        case 0: return g_autoGreen.load();
-        case 1: return g_autoRed.load();
-        case 2: return g_autoYellow.load();
-        case 3: return g_autoBlue.load();
-        case 4: return g_autoOrange.load();
-        default: return false;
-    }
-}
 
 // Color-specific note hit counters:
 // Fret 0 = Green, 1 = Red, 2 = Yellow, 3 = Blue, 4 = Orange
@@ -231,7 +210,6 @@ static void resetAllNoteCounters() {
     g_orangeMisses = 0;
 
     for (int i = 0; i < 5; i++) {
-        g_fretWindowFrames[i] = 0;
         g_fretVisualTimer[i] = 0;
         g_fretSustaining[i] = false;
         g_autoHitsCount[i] = 0;
@@ -250,6 +228,15 @@ static void resetAllNoteCounters() {
 // =========================================================================
 // Function Pointers & Hook Implementations
 // =========================================================================
+
+struct Vector3 {
+    float x;
+    float y;
+    float z;
+};
+
+static void *(*Component_get_transform)(void *component) = nullptr;
+static Vector3 (*Transform_get_position)(void *transform) = nullptr;
 
 // Forward declaration of visual fret function pointer
 void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr;
@@ -326,7 +313,6 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
             default: break;
         }
         if (fret >= 0 && fret < 5) {
-            g_fretWindowFrames[fret] = 0;
             g_fretSustaining[fret] = false;
         }
     }
@@ -360,7 +346,6 @@ void hook_Main_Notes_byv(void *instance) {
     g_orangeMisses = 0;
 
     for (int i = 0; i < 5; i++) {
-        g_fretWindowFrames[i] = 0;
         g_fretVisualTimer[i] = 0;
         g_fretSustaining[i] = false;
         g_autoHitsCount[i] = 0;
@@ -403,60 +388,74 @@ void hook_Main_Frets_byc(void *instance, int32_t fret, bool pressed) {
     }
 }
 
-// 7. Hook Main_Frets::byd (RVA: 0x1f9d19c)
-// Called by Main::FixedUpdate to test if a fret was strummed/hit for an active note in window
-bool (*old_Main_Frets_byd)(void *instance, int32_t fret) = nullptr;
-bool hook_Main_Frets_byd(void *instance, int32_t fret) {
+// 7. Hook Main_Notes::bzd (RVA: 0x20b9d5c)
+// Called every frame for each active note to update position
+// Triggers Auto Play HIT precisely when note enters the color circle!
+void (*old_Main_Notes_bzd)(void *instance, void *hm, float time) = nullptr;
+void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
+    // A. Let game update note position first
+    if (old_Main_Notes_bzd != nullptr) {
+        old_Main_Notes_bzd(instance, hm, time);
+    }
+
     if (instance != nullptr) {
-        mainFretsInstance = instance;
+        mainNotesInstance = instance;
     }
 
-    // A. Prioritize manual player press 100%
-    bool manual = false;
-    if (old_Main_Frets_byd != nullptr) {
-        manual = old_Main_Frets_byd(instance, fret);
-    }
-    if (manual) {
-        if (fret >= 0 && fret < 5) {
-            g_fretWindowFrames[fret] = 0;
-        }
-        return true;
+    // B. Check if Auto Play is enabled
+    if (!g_autoPlay.load() || hm == nullptr) {
+        return;
     }
 
-    // B. Smart Move Auto Hit logic
-    if (fret >= 0 && fret < 5 && isColorFretAutoEnabled(fret)) {
-        int timingMode = g_autoTimingMode.load();
-        int frames = ++g_fretWindowFrames[fret];
+    // Check if note is still active/unhit (NoteStatus.normal == 0)
+    int32_t status = *(int32_t *)((uintptr_t)hm + 0x40);
+    if (status != 0) {
+        return;
+    }
 
-        // Frame target inside hit window:
-        // Mode 0: 100% Perfect (frame 2, center sweet spot of hit window)
-        // Mode 1: Humanized (Legit pro-player timing variation: mostly frame 2, sometimes frame 3)
-        // Mode 2: Instant (frame 1, immediate trigger upon entering window)
-        int targetFrames = 1;
-        if (timingMode == 0) {
-            targetFrames = 2; // Perfect sweet spot
-        } else if (timingMode == 1) {
-            static unsigned int randSeed = 98765;
-            randSeed = randSeed * 1103515245 + 12345;
-            targetFrames = ((randSeed >> 16) % 10 < 8) ? 2 : 3;
-        }
+    int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
+    if (fret < 0 || fret > 4) {
+        return;
+    }
 
-        if (frames >= targetFrames) {
-            g_fretWindowFrames[fret] = 0;
-            g_autoHitsCount[fret]++;
-            g_totalAutoHits++;
+    // C. Measure note position precisely
+    if (Component_get_transform != nullptr && Transform_get_position != nullptr) {
+        void *transform = Component_get_transform(hm);
+        if (transform != nullptr) {
+            Vector3 pos = Transform_get_position(transform);
 
-            // Smart Move: Animate visual fret press on screen
-            if (g_autoVisualFret.load() && old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
-                old_Main_Frets_byc(mainFretsInstance, fret, true); // Press visual fret
-                g_fretVisualTimer[fret] = 5; // Hold visual press for ~80-100ms
+            // In Guitar Flash:
+            // Outer detection window starts at Z = -10.6f (still above the circle).
+            // The visual color circle / strike line is at Z ≈ -13.0f to -13.8f.
+            // Miss boundary is at Z = -15.5f.
+            // When pos.z <= -12.8f, the note is precisely inside the color circle!
+            if (pos.z <= -12.8f && pos.z >= -15.0f) {
+                // Execute Perfect hit directly on note
+                if (old_Main_Notes_byy != nullptr) {
+                    old_Main_Notes_byy(instance, hm, time);
+                }
+
+                // Check sustain note
+                void *rastro = *(void **)((uintptr_t)hm + 0x28);
+                if (rastro != nullptr) {
+                    bool hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
+                    if (hasRastro) {
+                        g_fretSustaining[fret] = true;
+                    }
+                }
+
+                // Animate visual fret press
+                if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                    old_Main_Frets_byc(mainFretsInstance, fret, true);
+                    g_fretVisualTimer[fret] = 5; // Hold visual button for ~80ms
+                }
+
+                g_autoHitsCount[fret]++;
+                g_totalAutoHits++;
+                LogDebug("Auto Play HIT inside color circle: fret=%d, z=%.2f, time=%.2f", fret, pos.z, time);
             }
-
-            return true;
         }
     }
-
-    return false;
 }
 
 // 8. Hook Main_Frets::bye (RVA: 0x1f9d1dc)
@@ -477,7 +476,7 @@ bool hook_Main_Frets_bye(void *instance, int32_t fret) {
     }
 
     // B. Auto Sustain hold
-    if (g_autoSustain.load() && fret >= 0 && fret < 5 && isColorFretAutoEnabled(fret)) {
+    if (g_autoPlay.load() && fret >= 0 && fret < 5) {
         if (g_fretSustaining[fret].load()) {
             return true;
         }
@@ -556,6 +555,10 @@ void *hack_thread(void *) {
 
 #if defined(__aarch64__)
 
+    // Resolve Unity Component & Transform methods
+    Component_get_transform = reinterpret_cast<void *(*)(void *)>(base + 0x3cac2f4);
+    Transform_get_position = reinterpret_cast<Vector3 (*)(void *)>(base + 0x3cbd5c0);
+
     // 1. Hook Main_Scorer::cdc (0x20c38a0)
     HOOK("0x20c38a0", hook_Main_Scorer_cdc, old_Main_Scorer_cdc);
     LogDebug("Hook Main_Scorer::cdc (0x20c38a0): %s", old_Main_Scorer_cdc != nullptr ? "SUCCESS" : "FAILED");
@@ -580,9 +583,9 @@ void *hack_thread(void *) {
     HOOK("0x1f9cec8", hook_Main_Frets_byc, old_Main_Frets_byc);
     LogDebug("Hook Main_Frets::byc (0x1f9cec8): %s", old_Main_Frets_byc != nullptr ? "SUCCESS" : "FAILED");
 
-    // 7. Hook Main_Frets::byd (0x1f9d19c) - Strum/hit trigger check
-    HOOK("0x1f9d19c", hook_Main_Frets_byd, old_Main_Frets_byd);
-    LogDebug("Hook Main_Frets::byd (0x1f9d19c): %s", old_Main_Frets_byd != nullptr ? "SUCCESS" : "FAILED");
+    // 7. Hook Main_Notes::bzd (0x20b9d5c) - Note position tracker & color circle auto hit
+    HOOK("0x20b9d5c", hook_Main_Notes_bzd, old_Main_Notes_bzd);
+    LogDebug("Hook Main_Notes::bzd (0x20b9d5c): %s", old_Main_Notes_bzd != nullptr ? "SUCCESS" : "FAILED");
 
     // 8. Hook Main_Frets::bye (0x1f9d1dc) - Sustain hold check
     HOOK("0x1f9d1dc", hook_Main_Frets_bye, old_Main_Frets_bye);
@@ -592,7 +595,7 @@ void *hack_thread(void *) {
     HOOK("0x20c50b0", hook_Main_Update, old_Main_Update);
     LogDebug("Hook Main::Update (0x20c50b0): %s", old_Main_Update != nullptr ? "SUCCESS" : "FAILED");
 
-    LogDebug("All Guitar Hero Real-Time & Auto Hit hooks installed successfully!");
+    LogDebug("All Guitar Hero Real-Time & Auto Play hooks installed successfully!");
 
 #else 
     LogDebug("ARM32 architecture not supported for this 64-bit target");
@@ -605,7 +608,7 @@ void *hack_thread(void *) {
 // JNI Method Implementations
 // =========================================================================
 
-// Returns [green, red, yellow, blue, orange, totalHits, totalMisses, totalCreated, totalAutoHits, autoMaster]
+// Returns [green, red, yellow, blue, orange, totalHits, totalMisses, totalCreated, totalAutoHits, autoPlay]
 jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
     jintArray result = env->NewIntArray(10);
     if (!result) return nullptr;
@@ -620,7 +623,7 @@ jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
     fill[6] = getNotesMiss();
     fill[7] = getNotesTotalCreated();
     fill[8] = g_totalAutoHits.load();
-    fill[9] = g_autoMaster.load() ? 1 : 0;
+    fill[9] = g_autoPlay.load() ? 1 : 0;
 
     env->SetIntArrayRegion(result, 0, 10, fill);
     return result;
@@ -630,26 +633,18 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     jobjectArray ret;
 
     const char *features[] = {
-            OBFUSCATE("Category_⚡ Auto Hit (Smart Move)"),
-            OBFUSCATE("10_Toggle_True_Master Auto Hit"),
-            OBFUSCATE("11_Toggle_True_🟢 Auto Green Note"),
-            OBFUSCATE("12_Toggle_True_🔴 Auto Red Note"),
-            OBFUSCATE("13_Toggle_True_🟡 Auto Yellow Note"),
-            OBFUSCATE("14_Toggle_True_🔵 Auto Blue Note"),
-            OBFUSCATE("15_Toggle_True_🟠 Auto Orange Note"),
-            OBFUSCATE("16_Spinner_Timing Mode_100% Perfect,Humanized (Legit),Instant"),
-            OBFUSCATE("17_Toggle_True_Sync Visual Fret Press"),
-            OBFUSCATE("18_Toggle_True_Auto Sustain (Long Note)"),
+            OBFUSCATE("Category_⚡ Automation"),
+            OBFUSCATE("10_Toggle_Auto Play"),
 
             OBFUSCATE("Category_Real-Time Note Counter"),
-            OBFUSCATE("0_Toggle_True_Floating Note HUD"),
-            OBFUSCATE("1_Toggle_True_Count Fret Errors as Miss"),
+            OBFUSCATE("0_Toggle_Floating Note HUD"),
+            OBFUSCATE("1_Toggle_Count Fret Errors as Miss"),
             OBFUSCATE("2_Button_Check Live Stats (Toast)"),
             OBFUSCATE("3_Button_Reset Note Counters"),
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
-            OBFUSCATE("Category_HUD & Fret Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>Smart Move: Animasi visual & timing natural.</small>"),
+            OBFUSCATE("Category_HUD & Color Legend"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>Auto Play: Hit otomatis tepat di lingkaran color.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -672,68 +667,14 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
          boolean, str != NULL ? env->GetStringUTFChars(str, 0) : "");
 
     switch (featNum) {
-        // Auto Hit Features
-        case 10: // Master Auto Hit
-            g_autoMaster = boolean;
-            LogDebug("Auto Hit Master toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Hit Master: AKTIF") : OBFUSCATE("⚡ Auto Hit Master: NONAKTIF"), ToastLength::LENGTH_SHORT);
+        // Single Auto Play Feature (OFF by default)
+        case 10:
+            g_autoPlay = boolean;
+            LogDebug("Auto Play toggled: %d", boolean);
+            Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Play: AKTIF") : OBFUSCATE("⚡ Auto Play: NONAKTIF"), ToastLength::LENGTH_SHORT);
             break;
 
-        case 11: // Auto Green
-            g_autoGreen = boolean;
-            LogDebug("Auto Green toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("🟢 Auto Green: ON") : OBFUSCATE("🟢 Auto Green: OFF"), ToastLength::LENGTH_SHORT);
-            break;
-
-        case 12: // Auto Red
-            g_autoRed = boolean;
-            LogDebug("Auto Red toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("🔴 Auto Red: ON") : OBFUSCATE("🔴 Auto Red: OFF"), ToastLength::LENGTH_SHORT);
-            break;
-
-        case 13: // Auto Yellow
-            g_autoYellow = boolean;
-            LogDebug("Auto Yellow toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("🟡 Auto Yellow: ON") : OBFUSCATE("🟡 Auto Yellow: OFF"), ToastLength::LENGTH_SHORT);
-            break;
-
-        case 14: // Auto Blue
-            g_autoBlue = boolean;
-            LogDebug("Auto Blue toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("🔵 Auto Blue: ON") : OBFUSCATE("🔵 Auto Blue: OFF"), ToastLength::LENGTH_SHORT);
-            break;
-
-        case 15: // Auto Orange
-            g_autoOrange = boolean;
-            LogDebug("Auto Orange toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("🟠 Auto Orange: ON") : OBFUSCATE("🟠 Auto Orange: OFF"), ToastLength::LENGTH_SHORT);
-            break;
-
-        case 16: // Timing Mode Spinner
-            g_autoTimingMode = value;
-            LogDebug("Auto Timing Mode changed: %d", value);
-            if (value == 0) {
-                Toast(env, obj, OBFUSCATE("Timing: 100% Perfect (Sweet Spot)"), ToastLength::LENGTH_SHORT);
-            } else if (value == 1) {
-                Toast(env, obj, OBFUSCATE("Timing: Humanized (Legit Pro)"), ToastLength::LENGTH_SHORT);
-            } else {
-                Toast(env, obj, OBFUSCATE("Timing: Instant (Edge of Window)"), ToastLength::LENGTH_SHORT);
-            }
-            break;
-
-        case 17: // Sync Visual Fret Press
-            g_autoVisualFret = boolean;
-            LogDebug("Auto Visual Fret Press toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("Animasi Visual Fret: ON") : OBFUSCATE("Animasi Visual Fret: OFF"), ToastLength::LENGTH_SHORT);
-            break;
-
-        case 18: // Auto Sustain
-            g_autoSustain = boolean;
-            LogDebug("Auto Sustain toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("Auto Sustain (Long Note): ON") : OBFUSCATE("Auto Sustain: OFF"), ToastLength::LENGTH_SHORT);
-            break;
-
-        // Note Counter & HUD Features
+        // Note Counter & HUD Features (OFF by default)
         case 0: // Toggle Floating Note HUD
             featureFloatingHUD = boolean;
             LogDebug("Feature Floating HUD toggled: %d", boolean);
