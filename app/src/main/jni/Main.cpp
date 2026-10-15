@@ -586,6 +586,90 @@ void hook_Main_Sounds_cfe(void *instance) {
     }
 }
 
+// =========================================================================
+// Song Unlock Feature (Toggle: OFF by default)
+// =========================================================================
+static std::atomic<bool> g_unlockAllSongs{false};
+static void *g_gcInstance = nullptr;
+
+// 11. Hook gc::blx (RVA: 0x1eaa984) - Song getter by index
+void *(*old_gc_blx)(void *instance, int32_t index) = nullptr;
+int32_t (*gc_bma)(void *instance) = nullptr; // RVA: 0x1eaa9dc - Song count
+
+static void UnlockAllSongsInMemory(void *gc) {
+    if (!gc) return;
+    int32_t count = 0;
+    if (gc_bma != nullptr) {
+        count = gc_bma(gc);
+    } else {
+        void *list = *(void **)((uintptr_t)gc + 0x20);
+        if (list) count = *(int32_t *)((uintptr_t)list + 0x18);
+    }
+    LogDebug("[UnlockSongs] Unlocking %d songs in gc memory", count);
+    for (int i = 0; i < count; i++) {
+        void *song = old_gc_blx != nullptr ? old_gc_blx(gc, i) : nullptr;
+        if (song != nullptr) {
+            *(int32_t *)((uintptr_t)song + 0x28) = 0; // level = 0
+            *(int32_t *)((uintptr_t)song + 0x2c) = 0; // preco = 0 (free)
+            *(bool *)((uintptr_t)song + 0x75) = false; // vip = false
+        }
+    }
+}
+
+void *hook_gc_blx(void *instance, int32_t index) {
+    if (instance != nullptr) {
+        g_gcInstance = instance;
+    }
+    void *song = nullptr;
+    if (old_gc_blx != nullptr) {
+        song = old_gc_blx(instance, index);
+    }
+    if (g_unlockAllSongs.load() && song != nullptr) {
+        *(int32_t *)((uintptr_t)song + 0x28) = 0; // level = 0
+        *(int32_t *)((uintptr_t)song + 0x2c) = 0; // preco = 0 (free)
+        *(bool *)((uintptr_t)song + 0x75) = false; // vip = false
+    }
+    return song;
+}
+
+// 12. Hook ma::get_Vip (RVA: 0x2116cfc) - Static VIP status getter
+bool (*old_ma_get_Vip)() = nullptr;
+bool hook_ma_get_Vip() {
+    if (g_unlockAllSongs.load()) {
+        return true; // Full VIP status granted
+    }
+    if (old_ma_get_Vip != nullptr) {
+        return old_ma_get_Vip();
+    }
+    return false;
+}
+
+// 13. Hook MenuMus_Setlist::cnn (RVA: 0x20f2ecc) - Setlist song play launcher
+void (*old_MenuMus_Setlist_cnn)(void *setlist, int32_t a, bool b) = nullptr;
+void hook_MenuMus_Setlist_cnn(void *setlist, int32_t a, bool b) {
+    if (g_unlockAllSongs.load()) {
+        b = true; // Mark song as unlocked/owned to bypass purchase dialog
+    }
+    if (old_MenuMus_Setlist_cnn != nullptr) {
+        old_MenuMus_Setlist_cnn(setlist, a, b);
+    }
+}
+
+// 14. Hook MenuMus_Setlist::cno (RVA: 0x20f3148) - Buy/Unlock song dialog interceptor
+void (*old_MenuMus_Setlist_cno)(void *setlist, int32_t a, bool b) = nullptr;
+void hook_MenuMus_Setlist_cno(void *setlist, int32_t a, bool b) {
+    if (g_unlockAllSongs.load()) {
+        LogDebug("[UnlockSongs] Intercepted lock dialog for song index %d, launching song directly", a);
+        if (old_MenuMus_Setlist_cnn != nullptr) {
+            old_MenuMus_Setlist_cnn(setlist, a, true);
+            return;
+        }
+    }
+    if (old_MenuMus_Setlist_cno != nullptr) {
+        old_MenuMus_Setlist_cno(setlist, a, b);
+    }
+}
+
 // Native Thread for Library Detection & Hooking
 void *hack_thread(void *) {
     LogDebug("=== Guitar Hero Mod Menu Native Thread Started ===");
@@ -653,7 +737,26 @@ void *hack_thread(void *) {
     HOOK("0x20e267c", hook_Main_Sounds_cfe, old_Main_Sounds_cfe);
     LogDebug("Hook Main_Sounds::cfe (0x20e267c): %s", old_Main_Sounds_cfe != nullptr ? "SUCCESS" : "FAILED");
 
-    LogDebug("All Guitar Hero Real-Time & Auto Play hooks installed successfully!");
+    // 11. Hook gc::blx (0x1eaa984) - Song getter by index
+    HOOK("0x1eaa984", hook_gc_blx, old_gc_blx);
+    LogDebug("Hook gc::blx (0x1eaa984): %s", old_gc_blx != nullptr ? "SUCCESS" : "FAILED");
+
+    // Resolve gc::bma (0x1eaa9dc) - Song count getter
+    gc_bma = reinterpret_cast<int32_t (*)(void *)>(base + 0x1eaa9dc);
+
+    // 12. Hook ma::get_Vip (0x2116cfc) - Static VIP status getter
+    HOOK("0x2116cfc", hook_ma_get_Vip, old_ma_get_Vip);
+    LogDebug("Hook ma::get_Vip (0x2116cfc): %s", old_ma_get_Vip != nullptr ? "SUCCESS" : "FAILED");
+
+    // 13. Hook MenuMus_Setlist::cnn (0x20f2ecc) - Setlist song play launcher
+    HOOK("0x20f2ecc", hook_MenuMus_Setlist_cnn, old_MenuMus_Setlist_cnn);
+    LogDebug("Hook MenuMus_Setlist::cnn (0x20f2ecc): %s", old_MenuMus_Setlist_cnn != nullptr ? "SUCCESS" : "FAILED");
+
+    // 14. Hook MenuMus_Setlist::cno (0x20f3148) - Buy/Unlock song dialog interceptor
+    HOOK("0x20f3148", hook_MenuMus_Setlist_cno, old_MenuMus_Setlist_cno);
+    LogDebug("Hook MenuMus_Setlist::cno (0x20f3148): %s", old_MenuMus_Setlist_cno != nullptr ? "SUCCESS" : "FAILED");
+
+    LogDebug("All Guitar Hero Real-Time, Auto Play & Song Unlock hooks installed successfully!");
 
 #else 
     LogDebug("ARM32 architecture not supported for this 64-bit target");
@@ -694,6 +797,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("Category_⚡ Automation"),
             OBFUSCATE("10_Toggle_Auto Play"),
 
+            OBFUSCATE("Category_🎵 Songs & Unlocks"),
+            OBFUSCATE("20_Toggle_Unlock All Songs"),
+
             OBFUSCATE("Category_Real-Time Note Counter"),
             OBFUSCATE("0_Toggle_Floating Note HUD"),
             OBFUSCATE("1_Toggle_Count Fret Errors as Miss"),
@@ -702,7 +808,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>Auto Play: Hit otomatis tepat di lingkaran color.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>Auto Play: Hit otomatis tepat di lingkaran color.<br>Unlock All Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -730,6 +836,20 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             g_autoPlay = boolean;
             LogDebug("Auto Play toggled: %d", boolean);
             Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Play: AKTIF") : OBFUSCATE("⚡ Auto Play: NONAKTIF"), ToastLength::LENGTH_SHORT);
+            break;
+
+        // Unlock All Songs Feature (OFF by default)
+        case 20:
+            g_unlockAllSongs = boolean;
+            LogDebug("Unlock All Songs toggled: %d", boolean);
+            if (boolean) {
+                if (g_gcInstance != nullptr) {
+                    UnlockAllSongsInMemory(g_gcInstance);
+                }
+                Toast(env, obj, OBFUSCATE("🎵 Unlock All Songs: AKTIF"), ToastLength::LENGTH_SHORT);
+            } else {
+                Toast(env, obj, OBFUSCATE("🎵 Unlock All Songs: NONAKTIF"), ToastLength::LENGTH_SHORT);
+            }
             break;
 
         // Note Counter & HUD Features (OFF by default)
