@@ -301,6 +301,36 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
         mainNotesInstance = instance;
     }
 
+    // 100% ACCURACY SAFETY NET FOR AUTO PLAY:
+    // If Auto Play is enabled, intercept miss calls and convert unhit notes to 100% Hits!
+    if (g_autoPlay.load()) {
+        if (hm != nullptr) {
+            int32_t status = *(int32_t *)((uintptr_t)hm + 0x40);
+            if (status == 0) { // Note was about to be missed in Hard mode
+                float songTime = 0.0f;
+                if (mainInstance != nullptr) {
+                    songTime = *(float *)((uintptr_t)mainInstance + 0x28);
+                }
+                hook_Main_Notes_byy(instance, hm, songTime);
+
+                int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
+                if (fret >= 0 && fret < 5) {
+                    if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                        old_Main_Frets_byc(mainFretsInstance, fret, true);
+                        g_fretVisualTimer[fret] = 4;
+                    }
+                    g_autoHitsCount[fret]++;
+                    g_totalAutoHits++;
+                    LogDebug("Auto Play 100%% Safety Hit: fret=%d, recovered unhit note at miss threshold", fret);
+                }
+                return; // Suppress miss completely - streak and combo preserved!
+            }
+        } else {
+            // Stray strum error (erradas), suppress in Auto Play mode
+            return;
+        }
+    }
+
     int32_t fret = -1;
     if (hm != nullptr) {
         fret = *(int32_t *)((uintptr_t)hm + 0x3c);
@@ -425,34 +455,23 @@ void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
             Vector3 pos = Transform_get_position(transform);
 
             // In Guitar Flash:
-            // Outer detection window starts at Z = -10.6f (still above the circle).
-            // The visual color circle / strike line is at Z ≈ -13.0f to -13.8f.
+            // Color circle target line starts visually when note enters pos.z <= -12.0f.
+            // Circle center is at Z ≈ -13.05f.
             // Miss boundary is at Z = -15.5f.
-            // When pos.z <= -12.8f, the note is precisely inside the color circle!
-            if (pos.z <= -12.8f && pos.z >= -15.0f) {
+            // Covering [-12.0f, -15.8f] ensures 100% frame coverage even at extreme note speeds in Hard mode!
+            if (pos.z <= -12.0f && pos.z >= -15.8f) {
                 // Execute Perfect hit directly on note
-                if (old_Main_Notes_byy != nullptr) {
-                    old_Main_Notes_byy(instance, hm, time);
-                }
-
-                // Check sustain note
-                void *rastro = *(void **)((uintptr_t)hm + 0x28);
-                if (rastro != nullptr) {
-                    bool hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
-                    if (hasRastro) {
-                        g_fretSustaining[fret] = true;
-                    }
-                }
+                hook_Main_Notes_byy(instance, hm, time);
 
                 // Animate visual fret press
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                     old_Main_Frets_byc(mainFretsInstance, fret, true);
-                    g_fretVisualTimer[fret] = 5; // Hold visual button for ~80ms
+                    g_fretVisualTimer[fret] = 4; // Crisp visual tap animation
                 }
 
                 g_autoHitsCount[fret]++;
                 g_totalAutoHits++;
-                LogDebug("Auto Play HIT inside color circle: fret=%d, z=%.2f, time=%.2f", fret, pos.z, time);
+                LogDebug("Auto Play HIT inside circle: fret=%d, z=%.2f, time=%.2f", fret, pos.z, time);
             }
         }
     }
