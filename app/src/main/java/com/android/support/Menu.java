@@ -105,6 +105,7 @@ public class Menu {
     ScrollView scrollView;
     boolean stopChecking, overlayRequired;
     Context getContext;
+    public static FloatingHUD floatingHUD;
 
     //initialize methods from the native library
     native void Init(Context context, TextView title, TextView subTitle);
@@ -119,12 +120,19 @@ public class Menu {
 
     native boolean IsGameLibLoaded();
 
+    public static native int[] GetNoteStats();
+
     //Here we write the code for our Menu
     // Reference: https://www.androidhive.info/2016/11/android-floating-widget-like-facebook-chat-head/
     public Menu(Context context) {
 
         getContext = context;
         Preferences.context = context;
+        try {
+            floatingHUD = new FloatingHUD(context);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to initialize FloatingHUD: " + e.getMessage());
+        }
         rootFrame = new FrameLayout(context); // Global markup
         rootFrame.setOnTouchListener(onTouchListener());
         mRootContainer = new RelativeLayout(context); // Markup on which two markups of the icon and the menu itself will be placed
@@ -548,11 +556,25 @@ public class Menu {
         switchR.setText(featName);
         switchR.setTextColor(TEXT_COLOR_2);
         switchR.setPadding(10, 5, 0, 5);
-        switchR.setChecked(Preferences.loadPrefBool(featName, featNum, swiOn));
+        boolean isChecked = Preferences.loadPrefBool(featName, featNum, swiOn);
+        switchR.setChecked(isChecked);
+        if (featNum == 0 && floatingHUD != null) {
+            if (isChecked) {
+                floatingHUD.show();
+            } else {
+                floatingHUD.hide();
+            }
+        }
         switchR.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             public void onCheckedChanged(CompoundButton compoundButton, boolean bool) {
                 Preferences.changeFeatureBool(featName, featNum, bool);
                 switch (featNum) {
+                    case 0:
+                        if (floatingHUD != null) {
+                            if (bool) floatingHUD.show();
+                            else floatingHUD.hide();
+                        }
+                        break;
                     case -1: //Save perferences
                         Preferences.with(switchR.getContext()).writeBoolean(-1, bool);
                         if (bool == false)
@@ -624,6 +646,11 @@ public class Menu {
                     case -6:
                         scrollView.removeView(mSettings);
                         scrollView.addView(mods);
+                        break;
+                    case 4:
+                        String logMsg = "Log Debug tersimpan di:\n/sdcard/0/Documents/guitar_hero_debug.log\natau /storage/emulated/0/Documents/";
+                        Toast.makeText(v.getContext(), logMsg, Toast.LENGTH_LONG).show();
+                        FloatingHUD.log("User checked debug log path");
                         break;
                     case -100:
                         stopChecking = true;

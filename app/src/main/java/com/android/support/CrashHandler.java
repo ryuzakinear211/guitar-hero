@@ -117,6 +117,8 @@ public final class CrashHandler {
                 } catch (IOException ignored) {
                 }
 
+                FloatingHUD.logCrash(errorLog);
+
                 Toast.makeText(app, "Game has crashed unexpectedly", Toast.LENGTH_LONG).show();
                 Toast.makeText(app, "Log saved to: " + String.valueOf(crashFile).replace("/storage/emulated/0/", ""), Toast.LENGTH_LONG).show();
 
