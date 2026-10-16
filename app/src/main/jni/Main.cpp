@@ -281,13 +281,24 @@ static inline int32_t getNotesTotalCreated() {
     return 0;
 }
 
-// Forward declaration of visual fret & particle function pointers
-void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr;
+// Function pointers for fret fire particle burst & Unity ParticleSystem (from commit e4947d)
+static void *(*Main_Frets_byh)(void *instance, int32_t fret) = nullptr;
+static void (*ParticleSystem_Play)(void *instance, void *dummy) = nullptr;
 static void (*GameObject_SetActive)(void *gameObject, bool active) = nullptr;
-static void *(*Main_Frets_byh)(void *instance, int32_t fret) = nullptr; // fire
-static void *(*Main_Frets_byi)(void *instance, int32_t fret) = nullptr; // spark
-static void (*ParticleSystem_Play)(void *ps, void *args) = nullptr;
-static void (*ParticleSystem_Stop)(void *ps, void *args) = nullptr;
+
+// Helper to trigger the fire particle burst on a fret circle (from commit e4947d)
+static void TriggerFretFireEffect(int32_t fret) {
+    if (fret < 0 || fret >= 5) return;
+    if (Main_Frets_byh != nullptr && ParticleSystem_Play != nullptr && mainFretsInstance != nullptr) {
+        void *ps = Main_Frets_byh(mainFretsInstance, fret);
+        if (ps != nullptr) {
+            ParticleSystem_Play(ps, nullptr);
+        }
+    }
+}
+
+// Forward declaration of visual fret function pointer
+void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr;
 
 // Helper to explicitly ensure the inner circular button GameObject is activated for finger touch
 static void SetFretButtonActive(int32_t fret, bool active) {
@@ -327,12 +338,6 @@ static void resetAllNoteCounters() {
         SetFretButtonActive(i, false);
         if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
             old_Main_Frets_byc(mainFretsInstance, i, false);
-        }
-        if (Main_Frets_byh != nullptr && ParticleSystem_Stop != nullptr && mainFretsInstance != nullptr) {
-            void *firePs = Main_Frets_byh(mainFretsInstance, i);
-            if (firePs != nullptr) {
-                ParticleSystem_Stop(firePs, nullptr);
-            }
         }
     }
     g_totalAutoHits = 0;
@@ -772,43 +777,14 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
             }
         }
 
-        // Track sustain notes (rastro: offset 0x28)
+        // Track sustain notes (rastro: offset 0x28) (from commit e4947d)
         if (fret >= 0 && fret < 5) {
             void *rastro = *(void **)((uintptr_t)hm + 0x28);
-            bool hasRastro = false;
             if (rastro != nullptr) {
-                hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
-            }
-
-            if (hasRastro) {
-                g_fretSustaining[fret] = true;
-                g_fretVisualTimer[fret] = 0; // Sustain manages duration until bzc
-            } else {
-                g_fretSustaining[fret] = false;
-                g_fretVisualTimer[fret] = 8; // Clean natural tap animation (~130ms)
-            }
-
-            if (g_autoPlay.load()) {
-                // Visual touch button animation (sentuhan fisik tombol lingkaran)
-                SetFretButtonActive(fret, true);
-                if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
-                    old_Main_Frets_byc(mainFretsInstance, fret, true); // Visual button pressed
-                }
-
-                // Trigger accurate spark & fire hit effect (percikan api pada note dan lingkaran)
-                if (mainFretsInstance != nullptr && ParticleSystem_Play != nullptr) {
-                    if (Main_Frets_byh != nullptr) {
-                        void *firePs = Main_Frets_byh(mainFretsInstance, fret);
-                        if (firePs != nullptr) {
-                            ParticleSystem_Play(firePs, nullptr);
-                        }
-                    }
-                    if (Main_Frets_byi != nullptr) {
-                        void *sparkPs = Main_Frets_byi(mainFretsInstance, fret);
-                        if (sparkPs != nullptr) {
-                            ParticleSystem_Play(sparkPs, nullptr);
-                        }
-                    }
+                // bool has: offset 0x20
+                bool hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
+                if (hasRastro) {
+                    g_fretSustaining[fret] = true;
                 }
             }
         }
@@ -848,12 +824,7 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
         mainNotesInstance = instance;
     }
 
-    int32_t fret = -1;
-    if (hm != nullptr) {
-        fret = *(int32_t *)((uintptr_t)hm + 0x3c);
-    }
-
-    // 100% ACCURACY SAFETY NET FOR AUTO PLAY:
+    // 100% ACCURACY SAFETY NET FOR AUTO PLAY (from commit e4947d):
     // If Auto Play is enabled, intercept miss calls and convert unhit notes to 100% Hits!
     if (g_autoPlay.load()) {
         if (hm != nullptr) {
@@ -864,7 +835,19 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
                     songTime = *(float *)((uintptr_t)mainInstance + 0x28);
                 }
                 hook_Main_Notes_byy(instance, hm, songTime);
-                LogDebug("Auto Play 100%% Safety Hit: fret=%d, recovered unhit note at miss threshold", fret);
+
+                int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
+                if (fret >= 0 && fret < 5) {
+                    TriggerFretFireEffect(fret);
+                    SetFretButtonActive(fret, true);
+                    if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                        old_Main_Frets_byc(mainFretsInstance, fret, true);
+                        g_fretVisualTimer[fret] = 4;
+                    }
+                    g_autoHitsCount[fret]++;
+                    g_totalAutoHits++;
+                    LogDebug("Auto Play 100%% Safety Hit: fret=%d, recovered unhit note at miss threshold", fret);
+                }
                 return; // Suppress miss completely - streak and combo preserved!
             }
         } else {
@@ -873,7 +856,9 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
         }
     }
 
+    int32_t fret = -1;
     if (hm != nullptr) {
+        fret = *(int32_t *)((uintptr_t)hm + 0x3c);
         switch (fret) {
             case 0: g_greenMisses++; break;
             case 1: g_redMisses++; break;
@@ -888,12 +873,6 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
             SetFretButtonActive(fret, false);
             if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                 old_Main_Frets_byc(mainFretsInstance, fret, false);
-            }
-            if (Main_Frets_byh != nullptr && ParticleSystem_Stop != nullptr && mainFretsInstance != nullptr) {
-                void *firePs = Main_Frets_byh(mainFretsInstance, fret);
-                if (firePs != nullptr) {
-                    ParticleSystem_Stop(firePs, nullptr);
-                }
             }
         }
     }
@@ -947,12 +926,6 @@ void hook_Main_Notes_byv(void *instance) {
         if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
             old_Main_Frets_byc(mainFretsInstance, i, false);
         }
-        if (Main_Frets_byh != nullptr && ParticleSystem_Stop != nullptr && mainFretsInstance != nullptr) {
-            void *firePs = Main_Frets_byh(mainFretsInstance, i);
-            if (firePs != nullptr) {
-                ParticleSystem_Stop(firePs, nullptr);
-            }
-        }
     }
     g_totalAutoHits = 0;
 
@@ -964,23 +937,16 @@ void hook_Main_Notes_byv(void *instance) {
 }
 
 // 5. Hook Main_Notes::bzc (RVA: 0x20b9874)
-// Called when a note's sustain/rastro trail ends
+// Called when a note's sustain/rastro trail ends (from commit e4947d)
 void (*old_Main_Notes_bzc)(void *instance, void *hm) = nullptr;
 void hook_Main_Notes_bzc(void *instance, void *hm) {
     if (hm != nullptr) {
         int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
         if (fret >= 0 && fret < 5) {
             g_fretSustaining[fret] = false;
-            g_fretVisualTimer[fret] = 0;
             SetFretButtonActive(fret, false);
             if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                 old_Main_Frets_byc(mainFretsInstance, fret, false); // Release visual fret
-            }
-            if (Main_Frets_byh != nullptr && ParticleSystem_Stop != nullptr && mainFretsInstance != nullptr) {
-                void *firePs = Main_Frets_byh(mainFretsInstance, fret);
-                if (firePs != nullptr) {
-                    ParticleSystem_Stop(firePs, nullptr);
-                }
             }
         }
     }
@@ -990,20 +956,11 @@ void hook_Main_Notes_bzc(void *instance, void *hm) {
 }
 
 // 6. Hook Main_Frets::byc (RVA: 0x1f9cec8)
-// Animates and controls visual button press/release on screen
+// Animates and controls visual button press/release on screen (from commit e4947d)
 void hook_Main_Frets_byc(void *instance, int32_t fret, bool pressed) {
     if (instance != nullptr) {
         mainFretsInstance = instance;
     }
-
-    // If Auto Play has an active touch timer or sustain hold on this fret,
-    // prevent the game's idle touch polling (byb) from canceling the touch within 1 frame
-    if (g_autoPlay.load() && fret >= 0 && fret < 5) {
-        if (!pressed && (g_fretVisualTimer[fret] > 0 || g_fretSustaining[fret].load())) {
-            return;
-        }
-    }
-
     if (old_Main_Frets_byc != nullptr) {
         old_Main_Frets_byc(instance, fret, pressed);
     }
@@ -1011,7 +968,7 @@ void hook_Main_Frets_byc(void *instance, int32_t fret, bool pressed) {
 
 // 7. Hook Main_Notes::bzd (RVA: 0x20b9d5c)
 // Called every frame for each active note to update position
-// Triggers Auto Play HIT precisely when note enters the color circle!
+// Triggers Auto Play HIT precisely when note enters the color circle! (from commit e4947d)
 void (*old_Main_Notes_bzd)(void *instance, void *hm, float time) = nullptr;
 void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
     // A. Let game update note position first
@@ -1045,11 +1002,26 @@ void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
         if (transform != nullptr) {
             Vector3 pos = Transform_get_position(transform);
 
-            // In Guitar Flash: center of color circle is at Z ≈ -13.05f.
-            // Hit note cleanly when it reaches the circle:
-            if (pos.z <= -12.90f && pos.z >= -15.5f) {
-                // Execute hit directly on note (hook_Main_Notes_byy handles press, particles & sustain)
+            // In Guitar Flash (from commit e4947d):
+            // Center of the color circle is at Z ≈ -13.05f.
+            // When pos.z <= -12.7f, the note is visually inside the color circle!
+            // Hits at Z ∈ [-12.7f, -15.5f] look completely natural, legit, and centered.
+            if (pos.z <= -12.7f && pos.z >= -15.5f) {
+                // Execute Perfect hit directly on note
                 hook_Main_Notes_byy(instance, hm, time);
+
+                // Trigger FIRE particle burst on the fret circle! (from commit e4947d)
+                TriggerFretFireEffect(fret);
+
+                // Animate visual fret press & touch button (mengikuti logika efek api)
+                SetFretButtonActive(fret, true);
+                if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                    old_Main_Frets_byc(mainFretsInstance, fret, true);
+                    g_fretVisualTimer[fret] = 4; // Crisp visual tap animation
+                }
+
+                g_autoHitsCount[fret]++;
+                g_totalAutoHits++;
                 LogDebug("Auto Play HIT inside circle: fret=%d, z=%.2f, time=%.2f", fret, pos.z, time);
             }
         }
@@ -1277,16 +1249,12 @@ void *hack_thread(void *) {
     GameObject_SetActive = reinterpret_cast<void (*)(void *, bool)>(base + 0x3caddcc);
     LogDebug("Resolve GameObject::SetActive (0x3caddcc): %s", GameObject_SetActive != nullptr ? "SUCCESS" : "FAILED");
 
-    // Resolve Fret Particle Effects (Fire: byh 0x1f9d290, Spark: byi 0x1f9d308) & Unity ParticleSystem methods
-    Main_Frets_byh = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1f9d290); // fire
-    Main_Frets_byi = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1f9d308); // spark
+    // Resolve Fret Fire Particle Effect & Unity ParticleSystem (from commit e4947d)
+    Main_Frets_byh = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1f9d290);
     ParticleSystem_Play = reinterpret_cast<void (*)(void *, void *)>(base + 0x3d05c0c);
-    ParticleSystem_Stop = reinterpret_cast<void (*)(void *, void *)>(base + 0x3d05dcc);
-    LogDebug("Resolve Fret Particles: byh=%s, byi=%s, PS_Play=%s, PS_Stop=%s",
+    LogDebug("Resolve Fret Fire: byh=%s, PS_Play=%s",
              Main_Frets_byh != nullptr ? "OK" : "FAIL",
-             Main_Frets_byi != nullptr ? "OK" : "FAIL",
-             ParticleSystem_Play != nullptr ? "OK" : "FAIL",
-             ParticleSystem_Stop != nullptr ? "OK" : "FAIL");
+             ParticleSystem_Play != nullptr ? "OK" : "FAIL");
 
 
     // 1. Hook Main_Scorer::cdc (0x20c38a0)
