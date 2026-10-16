@@ -130,19 +130,15 @@ static void *mainFretsInstance = nullptr;   // Pointer to Main_Frets
 static void *mainSpecialInstance = nullptr; // Pointer to Main_Special (MonoBehaviour)
 
 // =========================================================================
-// Auto Special Ability (Smart Pathing & Score Maximizer) State
+// Auto Special Ability (Chart-Aware Smart Pathing) State
 // =========================================================================
 static std::atomic<bool> g_autoSpecial{false};               // Master toggle: Auto Special Ability
-static std::atomic<int32_t> g_spPathTargetNote{400};        // Target Hit Note milestone (default 400 notes)
-static std::atomic<int32_t> g_spStrategy{0};                // 0: Smart Density & 8x Combo, 1: Milestone Note, 2: Always on 4x, 3: Instant Overdrive
-static std::atomic<bool> g_spAutoCharge{true};              // Auto Charge SP to full 4/4 (15s duration)
-static std::atomic<bool> g_forceTriggerSpecial{false};      // Force trigger request from UI button
 static std::atomic<bool> g_isSpecialActive{false};          // Live status: is Special active?
 static std::atomic<int32_t> g_currentCombo{0};              // Current live streak / combo count
 static std::atomic<int32_t> g_currentScore{0};              // Current total score
 static std::atomic<int32_t> g_lastActivatedAtNote{-1};      // Hit count at last activation to prevent double fire
 static std::atomic<int32_t> g_totalSpecialActivations{0};   // Total successful activations count
-static std::atomic<int32_t> g_specialEnergyLevel{0};        // Current SP energy (0..4)
+static std::atomic<int32_t> g_specialEnergyLevel{0};        // Current natural SP energy (0..4)
 
 // Circular buffer for calculating real-time note density (notes per second)
 static const int DENSITY_BUFFER_SIZE = 16;
@@ -320,11 +316,17 @@ static void TriggerFretFireEffect(int32_t fret) {
 // Forward declaration of visual fret function pointer
 void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr;
 
-// Smart Path Finder: Evaluates note milestone, combo, and density to fire 8x Special
+// Chart-Aware Smart Path Finder:
+// Intelligently triggers Special Ability (8x score) based on chart lookahead:
+// - Ensures base multiplier is 4x (combo >= 30) for maximum point yield.
+// - Inspects upcoming notes in ed::dya (NoteChart[]):
+//   1. If upcoming star power phrase falls within [songTime, songTime + duration] and energy < 4:
+//      HOLDS energy (does not activate) to prevent clipping/wasting the star power phrase.
+//   2. If no upcoming SP phrase in the activation window or energy is maxed (4 bars) or song finale:
+//      ACTIVATES legitimate Special Ability via native bzk(false) when notes are active!
+// - NEVER writes fake energy to epe, guaranteeing 100% server integrity without rollback to 4x.
 static void CheckAndTriggerSmartSpecial(float songTime) {
-    bool force = g_forceTriggerSpecial.exchange(false);
-
-    if (!force && !g_autoSpecial.load()) {
+    if (!g_autoSpecial.load()) {
         return;
     }
 
@@ -343,11 +345,11 @@ static void CheckAndTriggerSmartSpecial(float songTime) {
     // Check if Special is already active
     bool active = *(bool *)((uintptr_t)mainSpecialInstance + 0x21);
     g_isSpecialActive = active;
-    if (active && !force) {
+    if (active) {
         return; // Already enjoying 8x multiplier!
     }
 
-    // Read current energy from epe (0x40)
+    // Read natural energy level from epe (0x40)
     void *epe = *(void **)((uintptr_t)mainSpecialInstance + 0x40);
     int32_t currentEnergy = 0;
     if (epe != nullptr && lx_op_Implicit_to_int != nullptr) {
@@ -355,77 +357,101 @@ static void CheckAndTriggerSmartSpecial(float songTime) {
     }
     g_specialEnergyLevel = currentEnergy;
 
-    int32_t hits = getNotesHit();
+    // Minimum energy required by game engine to activate is 2 bars (50%)
+    if (currentEnergy < 2) {
+        return;
+    }
+
     int32_t combo = g_currentCombo.load();
-    int32_t target = g_spPathTargetNote.load();
-    int32_t strategy = g_spStrategy.load();
+    int32_t hits = getNotesHit();
 
-    bool trigger = force;
+    // Prevent rapid re-triggering at the exact same hit count range
+    if (g_lastActivatedAtNote.load() >= 0 && (hits - g_lastActivatedAtNote.load()) < 15) {
+        return;
+    }
 
-    if (!trigger) {
-        // Prevent rapid re-triggering at the same hit count range (debounce 30 notes)
-        if (g_lastActivatedAtNote.load() >= 0 && (hits - g_lastActivatedAtNote.load()) < 30) {
-            return;
-        }
+    // Golden Multiplier Rule: Only activate when base multiplier is 4x (combo >= 30)
+    // so Special catapults it straight to 8x!
+    if (combo < 30) {
+        return;
+    }
 
-        switch (strategy) {
-            case 0: { // Smart Density & 8x Combo (Highest Score Path)
-                // If a target note milestone is set (> 0), wait until note hits reach the target
-                if (target > 0 && hits < target) {
-                    break;
-                }
-                // Multiplier Golden Rule: Ensure combo >= 30 (4x multiplier, turns into 8x upon activation!)
-                if (combo >= 30 || (combo >= 15 && hits >= target)) {
-                    float density = CalculateNoteDensity(songTime);
-                    // Trigger on dense solo stream or milestone threshold
-                    if (density >= 1.5f || hits >= target) {
-                        trigger = true;
+    // Calculate activation duration based on natural energy (3.75s per bar: 2->7.5s, 3->11.25s, 4->15.0s)
+    float duration = (float)currentEnergy * 3.75f;
+    float windowEnd = songTime + duration + 0.4f; // Add slight buffer for phrase completion
+
+    bool shouldTrigger = false;
+
+    // Chart-Aware Lookahead Inspection
+    void *chart = *(void **)((uintptr_t)mainSpecialInstance + 0xd8); // ed* at 0xd8
+    if (chart != nullptr) {
+        void *dya = *(void **)((uintptr_t)chart + 0x20); // NoteChart[] at 0x20
+        if (dya != nullptr) {
+            uintptr_t noteCount = *(uintptr_t *)((uintptr_t)dya + 0x18);
+            void **items = (void **)((uintptr_t)dya + 0x20);
+
+            bool upcomingSpInWindow = false;
+            bool remainingSpInSong = false;
+            int notesInWindow = 0;
+
+            for (uintptr_t i = 0; i < noteCount; i++) {
+                void *nc = items[i];
+                if (nc == nullptr) continue;
+
+                float nTime = *(float *)((uintptr_t)nc + 0x14);
+                int32_t isSpecial = *(int32_t *)((uintptr_t)nc + 0x1c);
+
+                // Check notes ahead of current song time
+                if (nTime >= songTime) {
+                    if (nTime <= windowEnd) {
+                        notesInWindow++;
+                        if (isSpecial == 1) {
+                            upcomingSpInWindow = true;
+                        }
+                    } else {
+                        // Future note past this activation window
+                        if (isSpecial == 1) {
+                            remainingSpInSong = true;
+                        }
                     }
                 }
-                break;
             }
-            case 1: { // Milestone Note Target (Exact Target Milestone, e.g. Note 400)
-                if (hits >= target && combo >= 10) {
-                    trigger = true;
-                }
-                break;
-            }
-            case 2: { // Always on 4x Multiplier (Combo >= 30)
-                if (combo >= 30 && (target <= 0 || hits >= target)) {
-                    trigger = true;
-                }
-                break;
-            }
-            case 3: { // Instant Overdrive
-                if (target <= 0 || hits >= target) {
-                    trigger = true;
-                }
-                break;
+
+            // Path Decision Logic:
+            // 1. If energy is maxed (4 bars), we cannot bank anymore -> must activate!
+            // 2. If there are no more SP phrases left in the entire song -> activate all remaining energy!
+            // 3. If an upcoming SP phrase is in our window and energy < 4 -> HOLD energy! (Don't waste phrase)
+            // 4. If window is free of SP phrases and there are notes to multiply -> ACTIVATE!
+            if (currentEnergy >= 4) {
+                // Max energy reached, cannot bank more
+                shouldTrigger = (notesInWindow >= 2);
+            } else if (!remainingSpInSong && !upcomingSpInWindow) {
+                // Song finale / outro: no more SP phrases exist, burn remaining energy for max score
+                shouldTrigger = (notesInWindow >= 1);
+            } else if (upcomingSpInWindow) {
+                // Star power phrase inside window! HOLD to collect it and level up energy to 3 or 4 bars
+                shouldTrigger = false;
+            } else {
+                // Safe activation window: no SP phrases will be clipped
+                shouldTrigger = (notesInWindow >= 3);
             }
         }
     }
 
-    if (trigger) {
-        // Energy preparation:
-        if (g_spAutoCharge.load() || force) {
-            // Boost to 4 bars (100% full bar = 15 seconds max 8x overdrive duration)
-            if (lx_op_Implicit_from_int != nullptr) {
-                void *fullEnergy = lx_op_Implicit_from_int(4);
-                *(void **)((uintptr_t)mainSpecialInstance + 0x40) = fullEnergy;
-                g_specialEnergyLevel = 4;
-            }
-        } else {
-            // Legit mode: requires at least 2 bars (50%) from game
-            if (currentEnergy < 2) {
-                return; // Energy not ready yet
-            }
+    // Fallback if chart array is inaccessible
+    if (!shouldTrigger && chart == nullptr) {
+        float density = CalculateNoteDensity(songTime);
+        if (currentEnergy >= 4 || density >= 1.5f) {
+            shouldTrigger = true;
         }
+    }
 
-        // Unblock cooldown timer and ensure special UI is visible
+    if (shouldTrigger) {
+        // Clear game activation cooldown and ensure UI state
         *(float *)((uintptr_t)mainSpecialInstance + 0x24) = 0.0f; // timeBlocked = 0
         *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true;  // spShow = true
 
-        // Execute activation via native bzk
+        // Trigger native special ability activation (legitimate, no fake energy injection)
         if (old_Main_Special_bzk != nullptr) {
             old_Main_Special_bzk(mainSpecialInstance, false);
         } else if (Main_Special_bzk != nullptr) {
@@ -436,8 +462,8 @@ static void CheckAndTriggerSmartSpecial(float songTime) {
         g_lastActivatedAtNote = hits;
         g_totalSpecialActivations++;
 
-        LogDebug("⚡ [SmartSpecial] ACTIVATED at Note #%d (Target: %d) | Combo: %d | Density: %.2f nps | Total Activations: %d | 8x Multiplier Engaged!",
-                 hits, target, combo, CalculateNoteDensity(songTime), g_totalSpecialActivations.load());
+        LogDebug("⭐ [SmartSpecial] Optimal Path Triggered at Note #%d | Combo: %d (4x) | Natural Energy: %d/4 | Total Activations: %d",
+                 hits, combo, currentEnergy, g_totalSpecialActivations.load());
     }
 }
 
@@ -1015,12 +1041,12 @@ void *hack_thread(void *) {
 // =========================================================================
 
 // Returns [green, red, yellow, blue, orange, totalHits, totalMisses, totalCreated, totalAutoHits, autoPlay,
-//          specialActive, specialEnergy, currentCombo, currentScore, autoSpecialEnabled, pathTargetNote, totalSpecialActivations]
+//          specialActive, specialEnergy, currentCombo, currentScore, autoSpecialEnabled, totalSpecialActivations]
 jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
-    jintArray result = env->NewIntArray(17);
+    jintArray result = env->NewIntArray(16);
     if (!result) return nullptr;
 
-    jint fill[17];
+    jint fill[16];
     fill[0] = g_greenHits.load();
     fill[1] = g_redHits.load();
     fill[2] = g_yellowHits.load();
@@ -1036,10 +1062,9 @@ jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
     fill[12] = g_currentCombo.load();
     fill[13] = g_currentScore.load();
     fill[14] = g_autoSpecial.load() ? 1 : 0;
-    fill[15] = g_spPathTargetNote.load();
-    fill[16] = g_totalSpecialActivations.load();
+    fill[15] = g_totalSpecialActivations.load();
 
-    env->SetIntArrayRegion(result, 0, 17, fill);
+    env->SetIntArrayRegion(result, 0, 16, fill);
     return result;
 }
 
@@ -1050,10 +1075,6 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("Category_⚡ Automation"),
             OBFUSCATE("10_Toggle_Auto Play"),
             OBFUSCATE("11_Toggle_Auto Special (Smart Path)"),
-            OBFUSCATE("12_SeekBar_SP Path Note Target_0_1000"),
-            OBFUSCATE("13_Spinner_SP Strategy_Smart Density & 8x Combo,Milestone Note Target,Always on 4x Multiplier,Instant Overdrive"),
-            OBFUSCATE("14_Toggle_Auto Charge SP (15s Max)"),
-            OBFUSCATE("15_Button_🔥 Trigger Special Now"),
 
             OBFUSCATE("Category_🎵 Songs & Unlocks"),
             OBFUSCATE("20_Toggle_Unlock All Songs"),
@@ -1066,7 +1087,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>⭐ Auto Special: Smart path 8x score (Target default 400 note).<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>⭐ Auto Special: Smart path 8x score otomatis tanpa clipping SP phrase.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1101,53 +1122,6 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             g_autoSpecial = boolean;
             LogDebug("Auto Special toggled: %d", boolean);
             Toast(env, obj, boolean ? OBFUSCATE("⭐ Auto Special (Smart Path): AKTIF") : OBFUSCATE("⭐ Auto Special: NONAKTIF"), ToastLength::LENGTH_SHORT);
-            break;
-
-        // SP Path Note Target (SeekBar)
-        case 12: {
-            int32_t targetVal = value;
-            if (targetVal < 0) targetVal = 0;
-            g_spPathTargetNote = targetVal;
-            LogDebug("SP Path Note Target changed: %d", targetVal);
-            char targetMsg[128];
-            if (targetVal == 0) {
-                snprintf(targetMsg, sizeof(targetMsg), "🎯 SP Path Target: Tanpa Delay (Always on 4x Combo)");
-            } else {
-                snprintf(targetMsg, sizeof(targetMsg), "🎯 SP Path Target: Note #%d", targetVal);
-            }
-            Toast(env, obj, targetMsg, ToastLength::LENGTH_SHORT);
-            break;
-        }
-
-        // SP Strategy (Spinner)
-        case 13: {
-            g_spStrategy = value;
-            LogDebug("SP Strategy changed: %d", value);
-            const char *stratNames[] = {
-                "Smart Density & 8x Combo",
-                "Milestone Note Target",
-                "Always on 4x Multiplier",
-                "Instant Overdrive"
-            };
-            const char *selectedName = (value >= 0 && value < 4) ? stratNames[value] : "Custom";
-            char stratMsg[160];
-            snprintf(stratMsg, sizeof(stratMsg), "🧠 Strategy: %s", selectedName);
-            Toast(env, obj, stratMsg, ToastLength::LENGTH_SHORT);
-            break;
-        }
-
-        // Auto Charge SP (Toggle)
-        case 14:
-            g_spAutoCharge = boolean;
-            LogDebug("Auto Charge SP toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Charge SP: AKTIF (Full 15s)") : OBFUSCATE("⚡ Auto Charge SP: NONAKTIF (Legit 50%)"), ToastLength::LENGTH_SHORT);
-            break;
-
-        // Trigger Special Now (Button)
-        case 15:
-            g_forceTriggerSpecial = true;
-            LogDebug("User clicked: Trigger Special Now");
-            Toast(env, obj, OBFUSCATE("🔥 Special Ability Dinyalakan Sekarang!"), ToastLength::LENGTH_SHORT);
             break;
 
         // Unlock All Songs Feature (OFF by default)
@@ -1199,16 +1173,16 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             int32_t total = getNotesTotalCreated();
             int32_t autoTotal = g_totalAutoHits.load();
             int32_t combo = g_currentCombo.load();
-            int32_t spTarget = g_spPathTargetNote.load();
+            int32_t spEnergy = g_specialEnergyLevel.load();
             int32_t spActivations = g_totalSpecialActivations.load();
             bool spActive = g_isSpecialActive.load();
 
             char statsMsg[600];
             snprintf(statsMsg, sizeof(statsMsg),
-                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n⭐ SP: %s | Activations: %d\n🎯 Target Path: Note #%d\nTotal Notes: %d",
+                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n⭐ SP: %s | Energy: %d/4\n⚡ Activations: %d | Total Notes: %d",
                      green, red, yellow, blue, orange, hit, autoTotal, combo, miss,
-                     spActive ? "8x ACTIVE 🔥" : (g_autoSpecial.load() ? "READY (Pathing)" : "OFF"),
-                     spActivations, spTarget, total);
+                     spActive ? "8x ACTIVE 🔥" : (g_autoSpecial.load() ? "READY (Smart Path)" : "OFF"),
+                     spEnergy, spActivations, total);
 
             LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, SPActive=%d, Miss=%d",
                      hit, autoTotal, combo, spActive ? 1 : 0, miss);

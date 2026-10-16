@@ -59,7 +59,7 @@ public class FloatingHUD {
     private int pGreen = -1, pRed = -1, pYellow = -1, pBlue = -1, pOrange = -1;
     private int pMiss = -1, pTotal = -1;
     private int pCombo = -1, pSpecialActive = -1, pSpecialEnergy = -1;
-    private int pAutoSp = -1, pTargetNote = -1;
+    private int pAutoSp = -1, pActivations = -1;
 
     public FloatingHUD(Context context) {
         this.mContext = context;
@@ -324,10 +324,10 @@ public class FloatingHUD {
                             int combo = stats.length >= 13 ? stats[12] : 0;
                             int score = stats.length >= 14 ? stats[13] : 0;
                             int autoSp = stats.length >= 15 ? stats[14] : 0;
-                            int targetNote = stats.length >= 16 ? stats[15] : 400;
+                            int activations = stats.length >= 16 ? stats[15] : 0;
 
                             updateCounts(green, red, yellow, blue, orange, total, miss, autoHits, autoMaster,
-                                         spActive, spEnergy, combo, score, autoSp, targetNote);
+                                         spActive, spEnergy, combo, score, autoSp, activations);
                         }
                     } catch (Throwable t) {
                         log("Error updating stats: " + t.getMessage());
@@ -340,13 +340,13 @@ public class FloatingHUD {
     }
 
     public void updateCounts(int green, int red, int yellow, int blue, int orange, int total, int miss, int autoHits, int autoMaster,
-                             int spActive, int spEnergy, int combo, int score, int autoSp, int targetNote) {
+                             int spActive, int spEnergy, int combo, int score, int autoSp, int activations) {
         // Only redraw if any number changed
         if (green == pGreen && red == pRed && yellow == pYellow &&
                 blue == pBlue && orange == pOrange && total == pTotal &&
                 miss == pMiss && autoHits == pAuto && autoMaster == pAutoMaster &&
                 spActive == pSpecialActive && spEnergy == pSpecialEnergy &&
-                combo == pCombo && autoSp == pAutoSp && targetNote == pTargetNote) {
+                combo == pCombo && autoSp == pAutoSp && activations == pActivations) {
             return;
         }
 
@@ -363,7 +363,7 @@ public class FloatingHUD {
         pSpecialEnergy = spEnergy;
         pCombo = combo;
         pAutoSp = autoSp;
-        pTargetNote = targetNote;
+        pActivations = activations;
 
         tvGreen.setText("🟢 G: " + green);
         tvRed.setText("🔴 R: " + red);
@@ -401,10 +401,10 @@ public class FloatingHUD {
         if (spActive == 1) {
             tvSpecial.setText(Html.fromHtml("⭐ <b><font color='#FF007F'>8x ACTIVE!</font></b>"));
         } else if (autoSp == 1) {
-            if (targetNote > 0 && total < targetNote) {
-                tvSpecial.setText(Html.fromHtml("⭐ SP: <b><font color='#00E5FF'>Path " + total + "/" + targetNote + "</font></b>"));
+            if (spEnergy >= 2) {
+                tvSpecial.setText(Html.fromHtml("⭐ SP: <b><font color='#76FF03'>READY [" + spEnergy + "/4]</font></b>"));
             } else {
-                tvSpecial.setText(Html.fromHtml("⭐ SP: <b><font color='#76FF03'>PATH READY (4x)</font></b>"));
+                tvSpecial.setText(Html.fromHtml("⭐ SP: <b><font color='#00E5FF'>PATH [" + spEnergy + "/4]</font></b>"));
             }
         } else if (spEnergy >= 2) {
             tvSpecial.setText(Html.fromHtml("⭐ SP: <b><font color='#FFEA00'>[" + spEnergy + "/4 Ready]</font></b>"));
