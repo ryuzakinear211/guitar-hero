@@ -349,9 +349,13 @@ static void *(*Component_get_transform)(void *component) = nullptr;
 static Vector3 (*Transform_get_position)(void *transform) = nullptr;
 static void (*GameObject_SetActive)(void *gameObject, bool value) = nullptr;
 
-// Function pointers for fret fire particle burst & Unity ParticleSystem
-static void *(*Main_Frets_byh)(void *instance, int32_t fret) = nullptr;
+// Function pointers for fret particles (Fire, Bolt, Spark) & Unity ParticleSystem
+static void *(*Main_Frets_byh)(void *instance, int32_t fret) = nullptr; // Fire ParticleSystem
+static void *(*Main_Frets_byi)(void *instance, int32_t fret) = nullptr; // Bolt ParticleSystem
+static void *(*Main_Frets_byj)(void *instance, int32_t fret) = nullptr; // Spark ParticleSystem
+static void (*ParticleSystem_PlayWithChildren)(void *instance, bool withChildren) = nullptr;
 static void (*ParticleSystem_Play)(void *instance, void *dummy) = nullptr;
+static void (*ParticleSystem_Stop)(void *instance, void *dummy) = nullptr;
 
 // Function pointers for Special Ability & Obscured types
 static void (*Main_Special_bzk)(void *instance, bool a) = nullptr;
@@ -368,14 +372,67 @@ static void *(*ed_bad)(void *instance, int32_t a) = nullptr;
 // Forward declaration of visual fret function pointer
 void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr;
 
-// Helper to trigger the fire particle burst on a fret circle
-static void TriggerFretFireEffect(int32_t fret) {
-    if (fret < 0 || fret >= 5) return;
-    if (Main_Frets_byh != nullptr && ParticleSystem_Play != nullptr && mainFretsInstance != nullptr) {
-        void *ps = Main_Frets_byh(mainFretsInstance, fret);
-        if (ps != nullptr) {
-            ParticleSystem_Play(ps, nullptr);
+// Forward declaration of SetFretButtonActive
+static void SetFretButtonActive(int32_t fret, bool active);
+
+// Helper to trigger natural touch animation on note hit:
+// 1) Animate fret button press down & activate circular button (sentuhan fisik tombol)
+// 2) Burst spark particle effect (animasi sentuhan starburst tepat di note)
+// 3) Burst fire flame particle effect (animasi api menyala seperti screenshot)
+// 4) Burst bolt particle effect (efek petir/lightning jika aktif)
+// 5) Set humanized touch dwell time (7-10 frames / ~120-170ms) or sustain hold
+static void TriggerFretTouchAnimation(int32_t fret, bool isSustain) {
+    if (fret < 0 || fret >= 5 || mainFretsInstance == nullptr) return;
+
+    // 1. Visual button press (animasi fisik tombol ditekan ke dalam)
+    SetFretButtonActive(fret, true);
+    if (old_Main_Frets_byc != nullptr) {
+        old_Main_Frets_byc(mainFretsInstance, fret, true);
+    }
+
+    // 2. Trigger Spark Particle burst (animasi sentuhan note starburst)
+    if (Main_Frets_byj != nullptr) {
+        void *sparkPs = Main_Frets_byj(mainFretsInstance, fret);
+        if (sparkPs != nullptr) {
+            if (ParticleSystem_PlayWithChildren != nullptr) {
+                ParticleSystem_PlayWithChildren(sparkPs, true);
+            } else if (ParticleSystem_Play != nullptr) {
+                ParticleSystem_Play(sparkPs, nullptr);
+            }
         }
+    }
+
+    // 3. Trigger Fire Particle burst (animasi lidah api pada fret circle seperti screenshot)
+    if (Main_Frets_byh != nullptr) {
+        void *firePs = Main_Frets_byh(mainFretsInstance, fret);
+        if (firePs != nullptr) {
+            if (ParticleSystem_PlayWithChildren != nullptr) {
+                ParticleSystem_PlayWithChildren(firePs, true);
+            } else if (ParticleSystem_Play != nullptr) {
+                ParticleSystem_Play(firePs, nullptr);
+            }
+        }
+    }
+
+    // 4. Trigger Bolt Particle burst (efek petir/lightning)
+    if (Main_Frets_byi != nullptr) {
+        void *boltPs = Main_Frets_byi(mainFretsInstance, fret);
+        if (boltPs != nullptr) {
+            if (ParticleSystem_PlayWithChildren != nullptr) {
+                ParticleSystem_PlayWithChildren(boltPs, true);
+            } else if (ParticleSystem_Play != nullptr) {
+                ParticleSystem_Play(boltPs, nullptr);
+            }
+        }
+    }
+
+    // 5. Humanized touch dwell duration
+    if (isSustain) {
+        g_fretSustaining[fret] = true;
+    } else {
+        // Natural human finger tap dwell: 7 to 10 frames (~120ms to 170ms at 60fps)
+        int dwell = 7 + (rand() % 4);
+        g_fretVisualTimer[fret] = dwell;
     }
 }
 
@@ -883,13 +940,14 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
 
                 int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
                 if (fret >= 0 && fret < 5) {
-                    TriggerFretFireEffect(fret);
-                    g_fretVisualTimer[fret] = 10;
-                    SetFretButtonActive(fret, true);
-                    if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
-                        old_Main_Frets_byc(mainFretsInstance, fret, true);
+                    bool isSustain = false;
+                    void *rastro = *(void **)((uintptr_t)hm + 0x28);
+                    if (rastro != nullptr) {
+                        isSustain = *(bool *)((uintptr_t)rastro + 0x20);
                     }
-                    LogDebug("Auto Play 100%% Safety Hit: fret=%d, recovered unhit note at miss threshold", fret);
+                    TriggerFretTouchAnimation(fret, isSustain);
+                    LogDebug("Auto Play 100%% Safety Hit: fret=%d, recovered unhit note at miss threshold (sustain=%d)",
+                             fret, isSustain ? 1 : 0);
                 }
                 return; // Suppress miss completely - streak and combo preserved!
             }
@@ -995,6 +1053,13 @@ void hook_Main_Notes_bzc(void *instance, void *hm) {
             if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                 old_Main_Frets_byc(mainFretsInstance, fret, false); // Release visual fret
             }
+            // Cleanly stop the sustain flame particle
+            if (Main_Frets_byh != nullptr && ParticleSystem_Stop != nullptr && mainFretsInstance != nullptr) {
+                void *firePs = Main_Frets_byh(mainFretsInstance, fret);
+                if (firePs != nullptr) {
+                    ParticleSystem_Stop(firePs, nullptr);
+                }
+            }
         }
     }
     if (old_Main_Notes_bzc != nullptr) {
@@ -1061,23 +1126,25 @@ void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
 
             // In Guitar Flash:
             // Center of the color circle is at Z ≈ -13.05f.
-            // When pos.z <= -12.7f, the note is visually inside the color circle!
-            // Hits at Z ∈ [-12.7f, -15.5f] look completely natural, legit, and centered.
-            if (pos.z <= -12.7f && pos.z >= -15.5f) {
-                // Execute Perfect hit directly on note
-                hook_Main_Notes_byy(instance, hm, time);
+            // Humanized timing: natural human touch centered in the circle with realistic micro-jitter
+            float humanTargetZ = -12.98f - ((float)(rand() % 16) * 0.01f); // Range [-12.98f, -13.13f] centered in the circle
 
-                // Trigger FIRE particle burst on the fret circle!
-                TriggerFretFireEffect(fret);
-
-                // Animate visual fret press: Natural finger touch (10 frames = ~160ms)
-                g_fretVisualTimer[fret] = 10;
-                SetFretButtonActive(fret, true);
-                if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
-                    old_Main_Frets_byc(mainFretsInstance, fret, true);
+            if (pos.z <= humanTargetZ && pos.z >= -15.5f) {
+                // Check if note is sustain
+                bool isSustain = false;
+                void *rastro = *(void **)((uintptr_t)hm + 0x28);
+                if (rastro != nullptr) {
+                    isSustain = *(bool *)((uintptr_t)rastro + 0x20);
                 }
 
-                LogDebug("Auto Play HIT inside circle: fret=%d, z=%.2f, time=%.2f", fret, pos.z, time);
+                // Execute hit directly on note
+                hook_Main_Notes_byy(instance, hm, time);
+
+                // Trigger complete touch animation (button press + spark burst + fire flame + dwell time)
+                TriggerFretTouchAnimation(fret, isSustain);
+
+                LogDebug("Auto Play HIT inside circle: fret=%d, z=%.2f (target=%.2f), isSustain=%d, time=%.2f",
+                         fret, pos.z, humanTargetZ, isSustain ? 1 : 0, time);
             }
         }
     }
@@ -1181,6 +1248,12 @@ void hook_Main_Update(void *instance) {
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                     old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret cleanly
                 }
+                if (Main_Frets_byh != nullptr && ParticleSystem_Stop != nullptr && mainFretsInstance != nullptr) {
+                    void *firePs = Main_Frets_byh(mainFretsInstance, i);
+                    if (firePs != nullptr) {
+                        ParticleSystem_Stop(firePs, nullptr);
+                    }
+                }
             }
         }
 
@@ -1191,6 +1264,25 @@ void hook_Main_Update(void *instance) {
                 SetFretButtonActive(i, false);
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                     old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret
+                }
+            }
+        }
+    }
+
+    // Sustain touch loop: keep the flame actively burning on sustaining notes (matching screenshot)
+    static int s_sustainLoopCounter = 0;
+    if (++s_sustainLoopCounter % 6 == 0 && mainFretsInstance != nullptr) {
+        for (int i = 0; i < 5; i++) {
+            if (g_fretSustaining[i].load()) {
+                if (Main_Frets_byh != nullptr) {
+                    void *firePs = Main_Frets_byh(mainFretsInstance, i);
+                    if (firePs != nullptr) {
+                        if (ParticleSystem_PlayWithChildren != nullptr) {
+                            ParticleSystem_PlayWithChildren(firePs, true);
+                        } else if (ParticleSystem_Play != nullptr) {
+                            ParticleSystem_Play(firePs, nullptr);
+                        }
+                    }
                 }
             }
         }
@@ -1319,9 +1411,13 @@ void *hack_thread(void *) {
     GameObject_SetActive = reinterpret_cast<void (*)(void *, bool)>(base + 0x3caddcc);
     LogDebug("Resolve GameObject::SetActive (0x3caddcc): %s", GameObject_SetActive != nullptr ? "SUCCESS" : "FAILED");
 
-    // Resolve Fret Fire Particle Effect & Unity ParticleSystem methods
-    Main_Frets_byh = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1f9d290);
+    // Resolve Fret Particle Effects (Fire, Bolt, Spark) & Unity ParticleSystem methods
+    Main_Frets_byh = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1f9d290); // fire
+    Main_Frets_byi = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1f9d308); // bolt
+    Main_Frets_byj = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1f9d380); // spark
+    ParticleSystem_PlayWithChildren = reinterpret_cast<void (*)(void *, bool)>(base + 0x3d05b48);
     ParticleSystem_Play = reinterpret_cast<void (*)(void *, void *)>(base + 0x3d05c0c);
+    ParticleSystem_Stop = reinterpret_cast<void (*)(void *, void *)>(base + 0x3d05dcc);
 
     // 1. Hook Main_Scorer::cdc (0x20c38a0)
     HOOK("0x20c38a0", hook_Main_Scorer_cdc, old_Main_Scorer_cdc);
