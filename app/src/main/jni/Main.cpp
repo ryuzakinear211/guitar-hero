@@ -119,6 +119,7 @@ static std::atomic<bool> g_autoPlay{false};       // Master switch for Auto Play
 // Per-fret internal trackers (frets 0..4)
 static std::atomic<int> g_fretVisualTimer[5]{0, 0, 0, 0, 0};
 static std::atomic<bool> g_fretSustaining[5]{false, false, false, false, false};
+static std::atomic<int> g_fretSustainFrames[5]{0, 0, 0, 0, 0};
 static std::atomic<int32_t> g_autoHitsCount[5]{0, 0, 0, 0, 0};
 static std::atomic<int32_t> g_totalAutoHits{0};
 
@@ -284,7 +285,6 @@ static inline int32_t getNotesTotalCreated() {
 // Function pointers for fret fire particle burst & Unity ParticleSystem (from commit e4947d)
 static void *(*Main_Frets_byh)(void *instance, int32_t fret) = nullptr;
 static void (*ParticleSystem_Play)(void *instance, void *dummy) = nullptr;
-static void (*GameObject_SetActive)(void *gameObject, bool active) = nullptr;
 
 // Helper to trigger the fire particle burst on a fret circle (from commit e4947d)
 static void TriggerFretFireEffect(int32_t fret) {
@@ -299,23 +299,6 @@ static void TriggerFretFireEffect(int32_t fret) {
 
 // Forward declaration of visual fret function pointer
 void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr;
-
-// Helper to explicitly ensure the inner circular button GameObject is activated for finger touch
-static void SetFretButtonActive(int32_t fret, bool active) {
-    if (fret < 0 || fret >= 5 || mainFretsInstance == nullptr || GameObject_SetActive == nullptr) {
-        return;
-    }
-    void *fretsArr = *(void **)((uintptr_t)mainFretsInstance + 0x90);
-    if (fretsArr == nullptr) return;
-    void **items = (void **)((uintptr_t)fretsArr + 0x20);
-    if (items == nullptr) return;
-    void *fretObj = items[fret];
-    if (fretObj == nullptr) return;
-    void *button = *(void **)((uintptr_t)fretObj + 0x18);
-    if (button != nullptr) {
-        GameObject_SetActive(button, active);
-    }
-}
 
 static void resetAllNoteCounters() {
     g_greenHits = 0;
@@ -334,8 +317,8 @@ static void resetAllNoteCounters() {
     for (int i = 0; i < 5; i++) {
         g_fretVisualTimer[i] = 0;
         g_fretSustaining[i] = false;
+        g_fretSustainFrames[i] = 0;
         g_autoHitsCount[i] = 0;
-        SetFretButtonActive(i, false);
         if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
             old_Main_Frets_byc(mainFretsInstance, i, false);
         }
@@ -780,13 +763,13 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
         // Track sustain notes (rastro: offset 0x28) (from commit e4947d)
         if (fret >= 0 && fret < 5) {
             void *rastro = *(void **)((uintptr_t)hm + 0x28);
+            bool hasRastro = false;
             if (rastro != nullptr) {
                 // bool has: offset 0x20
-                bool hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
-                if (hasRastro) {
-                    g_fretSustaining[fret] = true;
-                }
+                hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
             }
+            g_fretSustaining[fret] = hasRastro;
+            g_fretSustainFrames[fret] = 0;
         }
 
         // Track live Star Power phrase progress
@@ -839,10 +822,9 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
                 int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
                 if (fret >= 0 && fret < 5) {
                     TriggerFretFireEffect(fret);
-                    SetFretButtonActive(fret, true);
                     if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                         old_Main_Frets_byc(mainFretsInstance, fret, true);
-                        g_fretVisualTimer[fret] = 4;
+                        g_fretVisualTimer[fret] = 5;
                     }
                     g_autoHitsCount[fret]++;
                     g_totalAutoHits++;
@@ -869,8 +851,8 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
         }
         if (fret >= 0 && fret < 5) {
             g_fretSustaining[fret] = false;
+            g_fretSustainFrames[fret] = 0;
             g_fretVisualTimer[fret] = 0;
-            SetFretButtonActive(fret, false);
             if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                 old_Main_Frets_byc(mainFretsInstance, fret, false);
             }
@@ -921,8 +903,8 @@ void hook_Main_Notes_byv(void *instance) {
     for (int i = 0; i < 5; i++) {
         g_fretVisualTimer[i] = 0;
         g_fretSustaining[i] = false;
+        g_fretSustainFrames[i] = 0;
         g_autoHitsCount[i] = 0;
-        SetFretButtonActive(i, false);
         if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
             old_Main_Frets_byc(mainFretsInstance, i, false);
         }
@@ -944,7 +926,8 @@ void hook_Main_Notes_bzc(void *instance, void *hm) {
         int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
         if (fret >= 0 && fret < 5) {
             g_fretSustaining[fret] = false;
-            SetFretButtonActive(fret, false);
+            g_fretSustainFrames[fret] = 0;
+            g_fretVisualTimer[fret] = 0;
             if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                 old_Main_Frets_byc(mainFretsInstance, fret, false); // Release visual fret
             }
@@ -961,6 +944,14 @@ void hook_Main_Frets_byc(void *instance, int32_t fret, bool pressed) {
     if (instance != nullptr) {
         mainFretsInstance = instance;
     }
+
+    if (g_autoPlay.load() && fret >= 0 && fret < 5) {
+        // Prevent idle touch polling (byb) from canceling the visual touch during active hit or sustain
+        if (!pressed && (g_fretVisualTimer[fret] > 0 || g_fretSustaining[fret].load())) {
+            return;
+        }
+    }
+
     if (old_Main_Frets_byc != nullptr) {
         old_Main_Frets_byc(instance, fret, pressed);
     }
@@ -1013,11 +1004,10 @@ void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
                 // Trigger FIRE particle burst on the fret circle! (from commit e4947d)
                 TriggerFretFireEffect(fret);
 
-                // Animate visual fret press & touch button (mengikuti logika efek api)
-                SetFretButtonActive(fret, true);
+                // Animate visual fret touch press synchronized with hit fire burst
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                     old_Main_Frets_byc(mainFretsInstance, fret, true);
-                    g_fretVisualTimer[fret] = 4; // Crisp visual tap animation
+                    g_fretVisualTimer[fret] = 5; // Crisp visual tap animation (~83ms, synchronized with hit)
                 }
 
                 g_autoHitsCount[fret]++;
@@ -1113,14 +1103,23 @@ void hook_Main_Update(void *instance) {
     }
     CheckAndTriggerSmartSpecial(songTime);
 
-    // Manage visual fret release timers for tap notes
+    // Manage visual fret release timers for tap notes & safety cap for sustain
     for (int i = 0; i < 5; i++) {
         if (g_fretVisualTimer[i] > 0) {
             int t = --g_fretVisualTimer[i];
             if (t == 0 && !g_fretSustaining[i].load()) {
-                SetFretButtonActive(i, false);
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
-                    old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret
+                    old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret cleanly!
+                }
+            }
+        } else if (g_fretSustaining[i].load()) {
+            g_fretSustainFrames[i]++;
+            // Safety cap: release if sustain exceeds 3 seconds (~180 frames)
+            if (g_fretSustainFrames[i] > 180) {
+                g_fretSustaining[i] = false;
+                g_fretSustainFrames[i] = 0;
+                if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                    old_Main_Frets_byc(mainFretsInstance, i, false);
                 }
             }
         }
@@ -1246,8 +1245,6 @@ void *hack_thread(void *) {
     // Resolve Unity Component & Transform methods
     Component_get_transform = reinterpret_cast<void *(*)(void *)>(base + 0x3cac2f4);
     Transform_get_position = reinterpret_cast<Vector3 (*)(void *)>(base + 0x3cbd5c0);
-    GameObject_SetActive = reinterpret_cast<void (*)(void *, bool)>(base + 0x3caddcc);
-    LogDebug("Resolve GameObject::SetActive (0x3caddcc): %s", GameObject_SetActive != nullptr ? "SUCCESS" : "FAILED");
 
     // Resolve Fret Fire Particle Effect & Unity ParticleSystem (from commit e4947d)
     Main_Frets_byh = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1f9d290);
@@ -1433,6 +1430,16 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
         // Auto Play Feature (OFF by default)
         case 10:
             g_autoPlay = boolean;
+            if (!boolean) {
+                for (int i = 0; i < 5; i++) {
+                    g_fretVisualTimer[i] = 0;
+                    g_fretSustaining[i] = false;
+                    g_fretSustainFrames[i] = 0;
+                    if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                        old_Main_Frets_byc(mainFretsInstance, i, false);
+                    }
+                }
+            }
             LogDebug("Auto Play toggled: %d", boolean);
             Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Play: AKTIF") : OBFUSCATE("⚡ Auto Play: NONAKTIF"), ToastLength::LENGTH_SHORT);
             break;
