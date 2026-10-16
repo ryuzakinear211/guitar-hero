@@ -140,6 +140,18 @@ static std::atomic<int32_t> g_lastActivatedAtNote{-1};      // Hit count at last
 static std::atomic<int32_t> g_totalSpecialActivations{0};   // Total successful activations count
 static std::atomic<int32_t> g_specialEnergyLevel{0};        // Current natural SP energy (0..4)
 
+// Cached Song Notes from Chart & Add hooks
+struct CachedSongNote {
+    int32_t num;
+    float time;
+    float duration;
+    int32_t special; // 1 if Star Power note, 0 otherwise
+};
+static std::vector<CachedSongNote> g_cachedChartNotes;
+static pthread_mutex_t g_chartNotesMutex = PTHREAD_MUTEX_INITIALIZER;
+static std::atomic<bool> g_starPhraseInProgress{false};
+static void *g_chartInstance = nullptr; // Pointer to ed (Chart Manager)
+
 // Circular buffer for calculating real-time note density (notes per second)
 static const int DENSITY_BUFFER_SIZE = 16;
 static float g_recentHitTimes[DENSITY_BUFFER_SIZE] = {0};
@@ -263,6 +275,12 @@ static void resetAllNoteCounters() {
     g_currentCombo = 0;
     g_currentScore = 0;
     g_isSpecialActive = false;
+    g_starPhraseInProgress = false;
+
+    pthread_mutex_lock(&g_chartNotesMutex);
+    g_cachedChartNotes.clear();
+    pthread_mutex_unlock(&g_chartNotesMutex);
+
     pthread_mutex_lock(&g_pathMutex);
     g_recentHitCount = 0;
     g_recentHitIndex = 0;
@@ -302,6 +320,42 @@ static void (*old_Main_Special_bzl)(void *instance) = nullptr;
 static int32_t (*lx_op_Implicit_to_int)(void *obscuredInt) = nullptr;
 static void *(*lx_op_Implicit_from_int)(int32_t value) = nullptr;
 
+// Function pointers for Chart & Note inspection
+static int32_t (*ed_Count)(void *instance) = nullptr;
+static void *(*ed_bad)(void *instance, int32_t a) = nullptr;
+
+static void (*old_ed_bab)(void *instance, int32_t a, void *b, int32_t c, void *d, void *e) = nullptr;
+static void hook_ed_bab(void *instance, int32_t a, void *b, int32_t c, void *d, void *e) {
+    if (instance != nullptr) {
+        g_chartInstance = instance;
+        LogDebug("ed::bab hooked: Captured g_chartInstance=0x%lx", (unsigned long)instance);
+    }
+    if (old_ed_bab != nullptr) {
+        old_ed_bab(instance, a, b, c, d, e);
+    }
+}
+
+static void (*old_Main_Notes_Add)(void *instance, int32_t num, void *noteChart) = nullptr;
+static void hook_Main_Notes_Add(void *instance, int32_t num, void *noteChart) {
+    if (instance != nullptr) {
+        mainNotesInstance = instance;
+    }
+    if (noteChart != nullptr) {
+        float nTime = *(float *)((uintptr_t)noteChart + 0x14);
+        float nDur = *(float *)((uintptr_t)noteChart + 0x18);
+        int32_t nSp = *(int32_t *)((uintptr_t)noteChart + 0x1c);
+        pthread_mutex_lock(&g_chartNotesMutex);
+        if (num == 0) {
+            g_cachedChartNotes.clear();
+        }
+        g_cachedChartNotes.push_back({num, nTime, nDur, nSp});
+        pthread_mutex_unlock(&g_chartNotesMutex);
+    }
+    if (old_Main_Notes_Add != nullptr) {
+        old_Main_Notes_Add(instance, num, noteChart);
+    }
+}
+
 // Helper to trigger the fire particle burst on a fret circle
 static void TriggerFretFireEffect(int32_t fret) {
     if (fret < 0 || fret >= 5) return;
@@ -319,7 +373,7 @@ void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr
 // Chart-Aware Smart Path Finder:
 // Intelligently triggers Special Ability (8x score) based on chart lookahead:
 // - Ensures base multiplier is 4x (combo >= 30) for maximum point yield.
-// - Inspects upcoming notes in ed::dya (NoteChart[]):
+// - Inspects upcoming notes in g_cachedChartNotes and ed::dya:
 //   1. If upcoming star power phrase falls within [songTime, songTime + duration] and energy < 4:
 //      HOLDS energy (does not activate) to prevent clipping/wasting the star power phrase.
 //   2. If no upcoming SP phrase in the activation window or energy is maxed (4 bars) or song finale:
@@ -365,7 +419,7 @@ static void CheckAndTriggerSmartSpecial(float songTime) {
     int32_t combo = g_currentCombo.load();
     int32_t hits = getNotesHit();
 
-    // Prevent rapid re-triggering at the exact same hit count range
+    // Prevent rapid re-triggering at the exact same hit count range (debounce at least 15 notes)
     if (g_lastActivatedAtNote.load() >= 0 && (hits - g_lastActivatedAtNote.load()) < 15) {
         return;
     }
@@ -376,72 +430,143 @@ static void CheckAndTriggerSmartSpecial(float songTime) {
         return;
     }
 
-    // Calculate activation duration based on natural energy (3.75s per bar: 2->7.5s, 3->11.25s, 4->15.0s)
+    // If a star power phrase is actively in progress on screen, HOLD until it finishes
+    // (unless energy is already at maximum 4 bars)
+    if (currentEnergy < 4 && g_starPhraseInProgress.load()) {
+        return;
+    }
+
+    // Calculate activation duration based on natural energy:
+    // 2 bars -> 7.5s, 3 bars -> 11.25s, 4 bars -> 15.0s
     float duration = (float)currentEnergy * 3.75f;
-    float windowEnd = songTime + duration + 0.4f; // Add slight buffer for phrase completion
+    float windowEnd = songTime + duration + 0.6f; // Extra margin to ensure phrase completion
 
     bool shouldTrigger = false;
+    bool chartAvailable = false;
+    bool upcomingSpInWindow = false;
+    bool remainingSpInSong = false;
+    int notesInWindow = 0;
 
-    // Chart-Aware Lookahead Inspection
-    void *chart = *(void **)((uintptr_t)mainSpecialInstance + 0xd8); // ed* at 0xd8
-    if (chart != nullptr) {
-        void *dya = *(void **)((uintptr_t)chart + 0x20); // NoteChart[] at 0x20
-        if (dya != nullptr) {
-            uintptr_t noteCount = *(uintptr_t *)((uintptr_t)dya + 0x18);
-            void **items = (void **)((uintptr_t)dya + 0x20);
+    // 1. First, check cached notes from Main_Notes::Add
+    pthread_mutex_lock(&g_chartNotesMutex);
+    if (!g_cachedChartNotes.empty()) {
+        chartAvailable = true;
+        for (const auto &cn : g_cachedChartNotes) {
+            if (cn.time >= songTime) {
+                if (cn.time <= windowEnd) {
+                    notesInWindow++;
+                    if (cn.special == 1) {
+                        upcomingSpInWindow = true;
+                    }
+                } else {
+                    if (cn.special == 1) {
+                        remainingSpInSong = true;
+                    }
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_chartNotesMutex);
 
-            bool upcomingSpInWindow = false;
-            bool remainingSpInSong = false;
-            int notesInWindow = 0;
+    // 2. If cached notes empty, check ed chart instance
+    if (!chartAvailable) {
+        void *chart = g_chartInstance;
+        if (chart == nullptr && mainInstance != nullptr) {
+            chart = *(void **)((uintptr_t)mainInstance + 0x58);
+        }
+        if (chart == nullptr && mainSpecialInstance != nullptr) {
+            chart = *(void **)((uintptr_t)mainSpecialInstance + 0xd8);
+        }
 
-            for (uintptr_t i = 0; i < noteCount; i++) {
-                void *nc = items[i];
-                if (nc == nullptr) continue;
-
-                float nTime = *(float *)((uintptr_t)nc + 0x14);
-                int32_t isSpecial = *(int32_t *)((uintptr_t)nc + 0x1c);
-
-                // Check notes ahead of current song time
-                if (nTime >= songTime) {
-                    if (nTime <= windowEnd) {
-                        notesInWindow++;
-                        if (isSpecial == 1) {
-                            upcomingSpInWindow = true;
-                        }
-                    } else {
-                        // Future note past this activation window
-                        if (isSpecial == 1) {
-                            remainingSpInSong = true;
+        if (chart != nullptr) {
+            // Try via ed_Count & ed_bad methods
+            if (ed_Count != nullptr && ed_bad != nullptr) {
+                int32_t count = ed_Count(chart);
+                if (count > 0) {
+                    chartAvailable = true;
+                    for (int32_t i = 0; i < count; i++) {
+                        void *nc = ed_bad(chart, i);
+                        if (nc == nullptr) continue;
+                        float nTime = *(float *)((uintptr_t)nc + 0x14);
+                        int32_t isSp = *(int32_t *)((uintptr_t)nc + 0x1c);
+                        if (nTime >= songTime) {
+                            if (nTime <= windowEnd) {
+                                notesInWindow++;
+                                if (isSp == 1) {
+                                    upcomingSpInWindow = true;
+                                }
+                            } else {
+                                if (isSp == 1) {
+                                    remainingSpInSong = true;
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            // Path Decision Logic:
-            // 1. If energy is maxed (4 bars), we cannot bank anymore -> must activate!
-            // 2. If there are no more SP phrases left in the entire song -> activate all remaining energy!
-            // 3. If an upcoming SP phrase is in our window and energy < 4 -> HOLD energy! (Don't waste phrase)
-            // 4. If window is free of SP phrases and there are notes to multiply -> ACTIVATE!
-            if (currentEnergy >= 4) {
-                // Max energy reached, cannot bank more
-                shouldTrigger = (notesInWindow >= 2);
-            } else if (!remainingSpInSong && !upcomingSpInWindow) {
-                // Song finale / outro: no more SP phrases exist, burn remaining energy for max score
-                shouldTrigger = (notesInWindow >= 1);
-            } else if (upcomingSpInWindow) {
-                // Star power phrase inside window! HOLD to collect it and level up energy to 3 or 4 bars
-                shouldTrigger = false;
-            } else {
-                // Safe activation window: no SP phrases will be clipped
-                shouldTrigger = (notesInWindow >= 3);
+            // If still not read, try direct array dya at 0x20
+            if (!chartAvailable) {
+                void *dya = *(void **)((uintptr_t)chart + 0x20);
+                if (dya != nullptr) {
+                    uintptr_t count = *(uintptr_t *)((uintptr_t)dya + 0x18);
+                    void **items = (void **)((uintptr_t)dya + 0x20);
+                    if (count > 0 && items != nullptr) {
+                        chartAvailable = true;
+                        for (uintptr_t i = 0; i < count; i++) {
+                            void *nc = items[i];
+                            if (nc == nullptr) continue;
+                            float nTime = *(float *)((uintptr_t)nc + 0x14);
+                            int32_t isSp = *(int32_t *)((uintptr_t)nc + 0x1c);
+                            if (nTime >= songTime) {
+                                if (nTime <= windowEnd) {
+                                    notesInWindow++;
+                                    if (isSp == 1) {
+                                        upcomingSpInWindow = true;
+                                    }
+                                } else {
+                                    if (isSp == 1) {
+                                        remainingSpInSong = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Fallback if chart array is inaccessible
-    if (!shouldTrigger && chart == nullptr) {
+    if (chartAvailable) {
+        // Path Decision Logic (Chart-Aware):
+        // 1. Max energy (4 bars): Bar is full, cannot bank more -> ACTIVATE!
+        // 2. Song finale / outro: No more SP phrases left in entire song -> ACTIVATE to exhaust energy!
+        // 3. SP phrase in window: Activating now would overlap and waste the phrase -> HOLD! (energy will reach 3 or 4)
+        // 4. Safe window: No SP phrase will be clipped, notes ahead are dense -> ACTIVATE!
+        if (currentEnergy >= 4) {
+            shouldTrigger = (notesInWindow >= 2);
+        } else if (!remainingSpInSong && !upcomingSpInWindow) {
+            shouldTrigger = (notesInWindow >= 1);
+        } else if (upcomingSpInWindow) {
+            // Upcoming SP phrase inside window! HOLD to collect it and level up energy to 3 or 4 bars!
+            shouldTrigger = false;
+        } else {
+            // Window is safe (no SP phrases clipped)
+            shouldTrigger = (notesInWindow >= 3);
+        }
+    } else {
+        // Intelligent Fallback (if chart memory cannot be traversed):
+        // Prevents triggering at 2 bars immediately every time!
+        // Energy 4: activate anytime on 4x combo
+        // Energy 3: activate on good density (>= 1.5 nps)
+        // Energy 2: only activate if banked past 100 notes and density >= 2.0 nps
+        int32_t notesSinceLast = (g_lastActivatedAtNote.load() >= 0) ? (hits - g_lastActivatedAtNote.load()) : hits;
         float density = CalculateNoteDensity(songTime);
-        if (currentEnergy >= 4 || density >= 1.5f) {
+        if (currentEnergy >= 4) {
+            shouldTrigger = true;
+        } else if (currentEnergy == 3 && density >= 1.5f) {
+            shouldTrigger = true;
+        } else if (currentEnergy == 2 && notesSinceLast >= 120 && density >= 2.0f) {
             shouldTrigger = true;
         }
     }
@@ -462,8 +587,8 @@ static void CheckAndTriggerSmartSpecial(float songTime) {
         g_lastActivatedAtNote = hits;
         g_totalSpecialActivations++;
 
-        LogDebug("⭐ [SmartSpecial] Optimal Path Triggered at Note #%d | Combo: %d (4x) | Natural Energy: %d/4 | Total Activations: %d",
-                 hits, combo, currentEnergy, g_totalSpecialActivations.load());
+        LogDebug("⭐ [SmartSpecial] Path Triggered at Note #%d | Combo: %d (4x) | Natural Energy: %d/4 | Total Activations: %d | ChartAvailable=%d",
+                 hits, combo, currentEnergy, g_totalSpecialActivations.load(), chartAvailable ? 1 : 0);
     }
 }
 
@@ -536,6 +661,21 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
                 bool hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
                 if (hasRastro) {
                     g_fretSustaining[fret] = true;
+                }
+            }
+        }
+
+        // Track live Star Power phrase progress
+        void *spObj = *(void **)((uintptr_t)hm + 0x30); // Special* at 0x30
+        if (spObj != nullptr) {
+            bool isStar = *(bool *)((uintptr_t)spObj + 0x10);
+            int32_t seq = *(int32_t *)((uintptr_t)spObj + 0x14);
+            int32_t seqSize = *(int32_t *)((uintptr_t)spObj + 0x18);
+            if (isStar) {
+                if (seqSize > 0 && seq < seqSize) {
+                    g_starPhraseInProgress = true;
+                } else if (seqSize > 0 && seq >= seqSize) {
+                    g_starPhraseInProgress = false; // Phrase completed!
                 }
             }
         }
@@ -621,6 +761,13 @@ void hook_Main_Notes_byv(void *instance) {
     if (instance != nullptr) {
         mainNotesInstance = instance;
     }
+
+    pthread_mutex_lock(&g_chartNotesMutex);
+    g_cachedChartNotes.clear();
+    pthread_mutex_unlock(&g_chartNotesMutex);
+    g_starPhraseInProgress = false;
+    g_lastActivatedAtNote = -1;
+    g_totalSpecialActivations = 0;
 
     g_greenHits = 0;
     g_redHits = 0;
@@ -802,11 +949,18 @@ void hook_Main_Update(void *instance) {
             mainScorerInstance = scorer;
         }
 
+        // Main.chart: 0x58
+        void *chart = *(void **)((uintptr_t)instance + 0x58);
+        if (chart != nullptr) {
+            g_chartInstance = chart;
+        }
+
         if (!g_mainCapturedLogged && notes != nullptr) {
             g_mainCapturedLogged = true;
-            LogDebug("Captured active instances: Main=0x%lx, Frets=0x%lx, Notes=0x%lx, Special=0x%lx, Scorer=0x%lx",
+            LogDebug("Captured active instances: Main=0x%lx, Frets=0x%lx, Notes=0x%lx, Special=0x%lx, Scorer=0x%lx, Chart=0x%lx",
                      (unsigned long)mainInstance, (unsigned long)mainFretsInstance,
-                     (unsigned long)mainNotesInstance, (unsigned long)mainSpecialInstance, (unsigned long)mainScorerInstance);
+                     (unsigned long)mainNotesInstance, (unsigned long)mainSpecialInstance,
+                     (unsigned long)mainScorerInstance, (unsigned long)g_chartInstance);
         }
     }
 
@@ -1026,6 +1180,18 @@ void *hack_thread(void *) {
     Main_Special_bzl = reinterpret_cast<void (*)(void *)>(base + 0x20bb068);
     HOOK("0x20bb068", hook_Main_Special_bzl, old_Main_Special_bzl);
     LogDebug("Hook Main_Special::bzl (0x20bb068): %s", old_Main_Special_bzl != nullptr ? "SUCCESS" : "FAILED");
+
+    // 18. Hook ed::bab (0x1c31de0) - Chart Loader & Instance Capture
+    HOOK("0x1c31de0", hook_ed_bab, old_ed_bab);
+    LogDebug("Hook ed::bab (0x1c31de0): %s", old_ed_bab != nullptr ? "SUCCESS" : "FAILED");
+
+    // 19. Hook Main_Notes::Add (0x20b8570) - Real-time Note & Star Power Chart Recorder
+    HOOK("0x20b8570", hook_Main_Notes_Add, old_Main_Notes_Add);
+    LogDebug("Hook Main_Notes::Add (0x20b8570): %s", old_Main_Notes_Add != nullptr ? "SUCCESS" : "FAILED");
+
+    // Resolve ed methods for chart lookahead inspection
+    ed_Count = reinterpret_cast<int32_t (*)(void *)>(base + 0x1c31f44);
+    ed_bad = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1c31f14);
 
     LogDebug("All Guitar Hero Real-Time, Auto Play, Smart Special & Song Unlock hooks installed successfully!");
 
