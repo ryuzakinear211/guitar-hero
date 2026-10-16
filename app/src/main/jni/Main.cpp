@@ -140,6 +140,38 @@ static std::atomic<int32_t> g_lastActivatedAtNote{-1};      // Hit count at last
 static std::atomic<int32_t> g_totalSpecialActivations{0};   // Total successful activations count
 static std::atomic<int32_t> g_specialEnergyLevel{0};        // Current natural SP energy (0..4)
 
+// =========================================================================
+// Deterministic Smart Path & Milestone System
+// =========================================================================
+struct SpPathMilestone {
+    int32_t targetHit;       // The exact hit count (or combo) where ability is triggered
+    int32_t requiredEnergy;  // Required energy bars (2, 3, or 4)
+};
+
+// Competitive chart path for Dragonforce - Through the Fire and Flames (Hard mode)
+// Path:  2    2    2    2    2    2    2     3     3     2     2     2     4
+// Kombo: 128  294  456  589  825  969  1095  1366  1823  2018  2152  2259  2607
+static const std::vector<SpPathMilestone> DRAGONFORCE_HARD_PATH = {
+    {128, 2},
+    {294, 2},
+    {456, 2},
+    {589, 2},
+    {825, 2},
+    {969, 2},
+    {1095, 2},
+    {1366, 3},
+    {1823, 3},
+    {2018, 2},
+    {2152, 2},
+    {2259, 2},
+    {2607, 4}
+};
+
+static std::vector<SpPathMilestone> g_activePathMilestones;
+static std::atomic<size_t> g_currentPathStep{0};
+static std::atomic<bool> g_isDragonforceSong{false};
+static std::string g_currentSongName = "";
+
 // Cached Song Notes from Chart & Add hooks
 struct CachedSongNote {
     int32_t num;
@@ -282,6 +314,8 @@ static void resetAllNoteCounters() {
     pthread_mutex_unlock(&g_chartNotesMutex);
 
     pthread_mutex_lock(&g_pathMutex);
+    g_activePathMilestones.clear();
+    g_currentPathStep = 0;
     g_recentHitCount = 0;
     g_recentHitIndex = 0;
     pthread_mutex_unlock(&g_pathMutex);
@@ -307,6 +341,7 @@ struct Vector3 {
 
 static void *(*Component_get_transform)(void *component) = nullptr;
 static Vector3 (*Transform_get_position)(void *transform) = nullptr;
+static void (*GameObject_SetActive)(void *gameObject, bool value) = nullptr;
 
 // Function pointers for fret fire particle burst & Unity ParticleSystem
 static void *(*Main_Frets_byh)(void *instance, int32_t fret) = nullptr;
@@ -324,17 +359,85 @@ static void *(*lx_op_Implicit_from_int)(int32_t value) = nullptr;
 static int32_t (*ed_Count)(void *instance) = nullptr;
 static void *(*ed_bad)(void *instance, int32_t a) = nullptr;
 
+// Forward declaration of visual fret function pointer
+void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr;
+
+// Helper to trigger the fire particle burst on a fret circle
+static void TriggerFretFireEffect(int32_t fret) {
+    if (fret < 0 || fret >= 5) return;
+    if (Main_Frets_byh != nullptr && ParticleSystem_Play != nullptr && mainFretsInstance != nullptr) {
+        void *ps = Main_Frets_byh(mainFretsInstance, fret);
+        if (ps != nullptr) {
+            ParticleSystem_Play(ps, nullptr);
+        }
+    }
+}
+
+// Helper to explicitly ensure the inner circular button GameObject is activated for finger touch
+static void SetFretButtonActive(int32_t fret, bool active) {
+    if (fret < 0 || fret >= 5 || mainFretsInstance == nullptr || GameObject_SetActive == nullptr) {
+        return;
+    }
+    void *fretsArr = *(void **)((uintptr_t)mainFretsInstance + 0x90);
+    if (fretsArr == nullptr) return;
+    void **items = (void **)((uintptr_t)fretsArr + 0x20);
+    if (items == nullptr) return;
+    void *fretObj = items[fret];
+    if (fretObj == nullptr) return;
+    void *button = *(void **)((uintptr_t)fretObj + 0x18);
+    if (button != nullptr) {
+        GameObject_SetActive(button, active);
+    }
+}
+
+// Helper to convert an Il2Cpp System.String to std::string
+static std::string Il2CppStringToStdString(void *il2cppString) {
+    if (il2cppString == nullptr) return "";
+    int32_t len = *(int32_t *)((uintptr_t)il2cppString + 0x10);
+    if (len <= 0 || len > 512) return "";
+    const uint16_t *chars = (const uint16_t *)((uintptr_t)il2cppString + 0x14);
+    std::string result;
+    result.reserve(len);
+    for (int i = 0; i < len; i++) {
+        uint16_t ch = chars[i];
+        if (ch < 128) {
+            result.push_back((char)ch);
+        } else {
+            result.push_back('?');
+        }
+    }
+    return result;
+}
+
+// Hook ed::bab (Chart loader & Song detector)
 static void (*old_ed_bab)(void *instance, int32_t a, void *b, int32_t c, void *d, void *e) = nullptr;
 static void hook_ed_bab(void *instance, int32_t a, void *b, int32_t c, void *d, void *e) {
     if (instance != nullptr) {
         g_chartInstance = instance;
         LogDebug("ed::bab hooked: Captured g_chartInstance=0x%lx", (unsigned long)instance);
     }
+    if (b != nullptr) {
+        std::string songStr = Il2CppStringToStdString(b);
+        g_currentSongName = songStr;
+        std::string lowerStr = songStr;
+        for (char &ch : lowerStr) ch = ::tolower(ch);
+        LogDebug("ed::bab song identifier: '%s'", songStr.c_str());
+        if (lowerStr.find("dragonforce") != std::string::npos ||
+            lowerStr.find("through the fire") != std::string::npos ||
+            lowerStr.find("fire and flames") != std::string::npos ||
+            lowerStr.find("ttfaf") != std::string::npos) {
+            g_isDragonforceSong = true;
+            LogDebug("Dragonforce TTFAF identified from song identifier!");
+        } else {
+            g_isDragonforceSong = false;
+        }
+    }
     if (old_ed_bab != nullptr) {
         old_ed_bab(instance, a, b, c, d, e);
     }
 }
 
+// Hook Main_Notes::Add (Real-time Note Recorder)
 static void (*old_Main_Notes_Add)(void *instance, int32_t num, void *noteChart) = nullptr;
 static void hook_Main_Notes_Add(void *instance, int32_t num, void *noteChart) {
     if (instance != nullptr) {
@@ -356,29 +459,149 @@ static void hook_Main_Notes_Add(void *instance, int32_t num, void *noteChart) {
     }
 }
 
-// Helper to trigger the fire particle burst on a fret circle
-static void TriggerFretFireEffect(int32_t fret) {
-    if (fret < 0 || fret >= 5) return;
-    if (Main_Frets_byh != nullptr && ParticleSystem_Play != nullptr && mainFretsInstance != nullptr) {
-        void *ps = Main_Frets_byh(mainFretsInstance, fret);
-        if (ps != nullptr) {
-            ParticleSystem_Play(ps, nullptr);
+// Build deterministic, non-random Star Power path milestones for any chart
+static void BuildSmartPathForChart() {
+    pthread_mutex_lock(&g_chartNotesMutex);
+    std::vector<CachedSongNote> notes = g_cachedChartNotes;
+    pthread_mutex_unlock(&g_chartNotesMutex);
+
+    pthread_mutex_lock(&g_pathMutex);
+    g_activePathMilestones.clear();
+    g_currentPathStep = 0;
+
+    // Check if current song is Dragonforce TTFAF (either via name or characteristic note count > 2500)
+    bool isDragonforce = g_isDragonforceSong.load();
+    if (!isDragonforce && notes.size() >= 2500) {
+        isDragonforce = true;
+        g_isDragonforceSong = true;
+    }
+
+    if (isDragonforce) {
+        g_activePathMilestones = DRAGONFORCE_HARD_PATH;
+        pthread_mutex_unlock(&g_pathMutex);
+        LogDebug("⭐ [SmartPath] Dragonforce TTFAF active! Loaded %zu competitive chart milestones:",
+                 g_activePathMilestones.size());
+        for (size_t i = 0; i < g_activePathMilestones.size(); i++) {
+            LogDebug("  [Dragonforce Step %zu] Trigger at Hit/Combo: %d | Req Energy: %d bars",
+                     i + 1, g_activePathMilestones[i].targetHit, g_activePathMilestones[i].requiredEnergy);
         }
+        return;
+    }
+
+    if (notes.empty()) {
+        pthread_mutex_unlock(&g_pathMutex);
+        LogDebug("[SmartPath] Notes cache empty, awaiting chart load...");
+        return;
+    }
+
+    // Group Star Power notes into contiguous phrases
+    struct SpPhrase {
+        int32_t startNote;
+        int32_t endNote;
+        float startTime;
+        float endTime;
+    };
+    std::vector<SpPhrase> phrases;
+
+    bool inPhrase = false;
+    SpPhrase curPhrase = {0, 0, 0.0f, 0.0f};
+
+    for (size_t i = 0; i < notes.size(); i++) {
+        if (notes[i].special == 1) {
+            if (!inPhrase) {
+                inPhrase = true;
+                curPhrase.startNote = notes[i].num;
+                curPhrase.startTime = notes[i].time;
+            }
+            curPhrase.endNote = notes[i].num;
+            curPhrase.endTime = notes[i].time + notes[i].duration;
+        } else {
+            if (inPhrase) {
+                inPhrase = false;
+                phrases.push_back(curPhrase);
+            }
+        }
+    }
+    if (inPhrase) {
+        phrases.push_back(curPhrase);
+    }
+
+    LogDebug("[SmartPath] Chart analyzed: %zu total notes, %zu Star Power phrases detected",
+             notes.size(), phrases.size());
+
+    if (phrases.empty()) {
+        // Fallback for custom charts without SP phrases: milestones spaced across song
+        for (int32_t h = 120; h < (int32_t)notes.size() - 50; h += 200) {
+            g_activePathMilestones.push_back({h, 2});
+        }
+        pthread_mutex_unlock(&g_pathMutex);
+        return;
+    }
+
+    // Deterministic simulation: schedule activations at exact phrase ends where window is clear
+    int32_t simEnergy = 0;
+    float simActivationEndTime = -1.0f;
+
+    for (size_t p = 0; p < phrases.size(); p++) {
+        const auto &ph = phrases[p];
+        if (ph.startTime < simActivationEndTime) {
+            // Overlapped by previous active Special, phrase not banked
+            continue;
+        }
+
+        if (simEnergy < 4) {
+            simEnergy++;
+        }
+
+        if (simEnergy >= 2) {
+            bool hasNextPhrase = (p + 1 < phrases.size());
+            float nextPhraseStart = hasNextPhrase ? phrases[p + 1].startTime : 999999.0f;
+            float duration = (float)simEnergy * 3.75f;
+            float proposedEndTime = ph.endTime + duration + 0.6f;
+
+            bool shouldSchedule = false;
+            if (simEnergy >= 4) {
+                // Bar full, must activate to prevent waste
+                shouldSchedule = true;
+            } else if (!hasNextPhrase) {
+                // Outro, no more phrases
+                shouldSchedule = true;
+            } else if (proposedEndTime <= nextPhraseStart) {
+                // Clean window without clipping upcoming SP phrase!
+                shouldSchedule = true;
+            }
+
+            if (shouldSchedule) {
+                int32_t targetHit = ph.endNote;
+                if (targetHit < 30) targetHit = 30; // 4x multiplier threshold
+                g_activePathMilestones.push_back({targetHit, simEnergy});
+                simActivationEndTime = ph.endTime + duration;
+                simEnergy = 0;
+            }
+        }
+    }
+
+    // Outro check: if energy remained at end of song
+    if (simEnergy >= 2 && !notes.empty()) {
+        int32_t outroHit = notes.back().num - 30;
+        if (outroHit > 30) {
+            g_activePathMilestones.push_back({outroHit, simEnergy});
+        }
+    }
+
+    pthread_mutex_unlock(&g_pathMutex);
+
+    LogDebug("⭐ [SmartPath] Generated %zu deterministic milestones for '%s':",
+             g_activePathMilestones.size(), g_currentSongName.c_str());
+    for (size_t i = 0; i < g_activePathMilestones.size(); i++) {
+        LogDebug("  [Step %zu] Trigger at Hit/Combo: %d | Req Energy: %d bars",
+                 i + 1, g_activePathMilestones[i].targetHit, g_activePathMilestones[i].requiredEnergy);
     }
 }
 
-// Forward declaration of visual fret function pointer
-void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr;
-
-// Chart-Aware Smart Path Finder:
-// Intelligently triggers Special Ability (8x score) based on chart lookahead:
-// - Ensures base multiplier is 4x (combo >= 30) for maximum point yield.
-// - Inspects upcoming notes in g_cachedChartNotes and ed::dya:
-//   1. If upcoming star power phrase falls within [songTime, songTime + duration] and energy < 4:
-//      HOLDS energy (does not activate) to prevent clipping/wasting the star power phrase.
-//   2. If no upcoming SP phrase in the activation window or energy is maxed (4 bars) or song finale:
-//      ACTIVATES legitimate Special Ability via native bzk(false) when notes are active!
-// - NEVER writes fake energy to epe, guaranteeing 100% server integrity without rollback to 4x.
+// Deterministic Smart Path Trigger:
+// Activates Special Ability PRECISELY when the song hit count / combo reaches the charted milestone.
+// Zero randomness. Completely aligned with hit milestones and natural energy!
 static void CheckAndTriggerSmartSpecial(float songTime) {
     if (!g_autoSpecial.load()) {
         return;
@@ -419,177 +642,66 @@ static void CheckAndTriggerSmartSpecial(float songTime) {
     int32_t combo = g_currentCombo.load();
     int32_t hits = getNotesHit();
 
-    // Prevent rapid re-triggering at the exact same hit count range (debounce at least 15 notes)
-    if (g_lastActivatedAtNote.load() >= 0 && (hits - g_lastActivatedAtNote.load()) < 15) {
+    // Prevent rapid re-triggering at the exact same hit count
+    if (g_lastActivatedAtNote.load() >= 0 && (hits - g_lastActivatedAtNote.load()) < 10) {
         return;
     }
 
-    // Golden Multiplier Rule: Only activate when base multiplier is 4x (combo >= 30)
-    // so Special catapults it straight to 8x!
+    // Multiplier safety: ensure combo >= 30 for 4x base multiplier -> 8x
     if (combo < 30) {
         return;
     }
 
-    // If a star power phrase is actively in progress on screen, HOLD until it finishes
-    // (unless energy is already at maximum 4 bars)
+    // Hold if Star Power phrase is actively in progress
     if (currentEnergy < 4 && g_starPhraseInProgress.load()) {
         return;
     }
 
-    // Calculate activation duration based on natural energy:
-    // 2 bars -> 7.5s, 3 bars -> 11.25s, 4 bars -> 15.0s
-    float duration = (float)currentEnergy * 3.75f;
-    float windowEnd = songTime + duration + 0.6f; // Extra margin to ensure phrase completion
-
-    bool shouldTrigger = false;
-    bool chartAvailable = false;
-    bool upcomingSpInWindow = false;
-    bool remainingSpInSong = false;
-    int notesInWindow = 0;
-
-    // 1. First, check cached notes from Main_Notes::Add
-    pthread_mutex_lock(&g_chartNotesMutex);
-    if (!g_cachedChartNotes.empty()) {
-        chartAvailable = true;
-        for (const auto &cn : g_cachedChartNotes) {
-            if (cn.time >= songTime) {
-                if (cn.time <= windowEnd) {
-                    notesInWindow++;
-                    if (cn.special == 1) {
-                        upcomingSpInWindow = true;
-                    }
-                } else {
-                    if (cn.special == 1) {
-                        remainingSpInSong = true;
-                    }
-                }
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_chartNotesMutex);
-
-    // 2. If cached notes empty, check ed chart instance
-    if (!chartAvailable) {
-        void *chart = g_chartInstance;
-        if (chart == nullptr && mainInstance != nullptr) {
-            chart = *(void **)((uintptr_t)mainInstance + 0x58);
-        }
-        if (chart == nullptr && mainSpecialInstance != nullptr) {
-            chart = *(void **)((uintptr_t)mainSpecialInstance + 0xd8);
-        }
-
-        if (chart != nullptr) {
-            // Try via ed_Count & ed_bad methods
-            if (ed_Count != nullptr && ed_bad != nullptr) {
-                int32_t count = ed_Count(chart);
-                if (count > 0) {
-                    chartAvailable = true;
-                    for (int32_t i = 0; i < count; i++) {
-                        void *nc = ed_bad(chart, i);
-                        if (nc == nullptr) continue;
-                        float nTime = *(float *)((uintptr_t)nc + 0x14);
-                        int32_t isSp = *(int32_t *)((uintptr_t)nc + 0x1c);
-                        if (nTime >= songTime) {
-                            if (nTime <= windowEnd) {
-                                notesInWindow++;
-                                if (isSp == 1) {
-                                    upcomingSpInWindow = true;
-                                }
-                            } else {
-                                if (isSp == 1) {
-                                    remainingSpInSong = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // If still not read, try direct array dya at 0x20
-            if (!chartAvailable) {
-                void *dya = *(void **)((uintptr_t)chart + 0x20);
-                if (dya != nullptr) {
-                    uintptr_t count = *(uintptr_t *)((uintptr_t)dya + 0x18);
-                    void **items = (void **)((uintptr_t)dya + 0x20);
-                    if (count > 0 && items != nullptr) {
-                        chartAvailable = true;
-                        for (uintptr_t i = 0; i < count; i++) {
-                            void *nc = items[i];
-                            if (nc == nullptr) continue;
-                            float nTime = *(float *)((uintptr_t)nc + 0x14);
-                            int32_t isSp = *(int32_t *)((uintptr_t)nc + 0x1c);
-                            if (nTime >= songTime) {
-                                if (nTime <= windowEnd) {
-                                    notesInWindow++;
-                                    if (isSp == 1) {
-                                        upcomingSpInWindow = true;
-                                    }
-                                } else {
-                                    if (isSp == 1) {
-                                        remainingSpInSong = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    pthread_mutex_lock(&g_pathMutex);
+    if (g_activePathMilestones.empty()) {
+        pthread_mutex_unlock(&g_pathMutex);
+        BuildSmartPathForChart();
+        pthread_mutex_lock(&g_pathMutex);
     }
 
-    if (chartAvailable) {
-        // Path Decision Logic (Chart-Aware):
-        // 1. Max energy (4 bars): Bar is full, cannot bank more -> ACTIVATE!
-        // 2. Song finale / outro: No more SP phrases left in entire song -> ACTIVATE to exhaust energy!
-        // 3. SP phrase in window: Activating now would overlap and waste the phrase -> HOLD! (energy will reach 3 or 4)
-        // 4. Safe window: No SP phrase will be clipped, notes ahead are dense -> ACTIVATE!
-        if (currentEnergy >= 4) {
-            shouldTrigger = (notesInWindow >= 2);
-        } else if (!remainingSpInSong && !upcomingSpInWindow) {
-            shouldTrigger = (notesInWindow >= 1);
-        } else if (upcomingSpInWindow) {
-            // Upcoming SP phrase inside window! HOLD to collect it and level up energy to 3 or 4 bars!
-            shouldTrigger = false;
-        } else {
-            // Window is safe (no SP phrases clipped)
-            shouldTrigger = (notesInWindow >= 3);
-        }
-    } else {
-        // Intelligent Fallback (if chart memory cannot be traversed):
-        // Prevents triggering at 2 bars immediately every time!
-        // Energy 4: activate anytime on 4x combo
-        // Energy 3: activate on good density (>= 1.5 nps)
-        // Energy 2: only activate if banked past 100 notes and density >= 2.0 nps
-        int32_t notesSinceLast = (g_lastActivatedAtNote.load() >= 0) ? (hits - g_lastActivatedAtNote.load()) : hits;
-        float density = CalculateNoteDensity(songTime);
-        if (currentEnergy >= 4) {
-            shouldTrigger = true;
-        } else if (currentEnergy == 3 && density >= 1.5f) {
-            shouldTrigger = true;
-        } else if (currentEnergy == 2 && notesSinceLast >= 120 && density >= 2.0f) {
-            shouldTrigger = true;
-        }
+    size_t stepIdx = g_currentPathStep.load();
+    if (stepIdx >= g_activePathMilestones.size()) {
+        pthread_mutex_unlock(&g_pathMutex);
+        return; // All scheduled milestones completed
     }
 
-    if (shouldTrigger) {
-        // Clear game activation cooldown and ensure UI state
-        *(float *)((uintptr_t)mainSpecialInstance + 0x24) = 0.0f; // timeBlocked = 0
-        *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true;  // spShow = true
+    const SpPathMilestone step = g_activePathMilestones[stepIdx];
+    pthread_mutex_unlock(&g_pathMutex);
 
-        // Trigger native special ability activation (legitimate, no fake energy injection)
-        if (old_Main_Special_bzk != nullptr) {
-            old_Main_Special_bzk(mainSpecialInstance, false);
-        } else if (Main_Special_bzk != nullptr) {
-            Main_Special_bzk(mainSpecialInstance, false);
-        }
-
-        g_isSpecialActive = true;
-        g_lastActivatedAtNote = hits;
-        g_totalSpecialActivations++;
-
-        LogDebug("⭐ [SmartSpecial] Path Triggered at Note #%d | Combo: %d (4x) | Natural Energy: %d/4 | Total Activations: %d | ChartAvailable=%d",
-                 hits, combo, currentEnergy, g_totalSpecialActivations.load(), chartAvailable ? 1 : 0);
+    // EXACT HIT / COMBO MILESTONE CHECK:
+    // Ability must trigger WHEN hit count or combo reaches the scheduled milestone!
+    // Never trigger at random hit counts!
+    if (hits < step.targetHit && combo < step.targetHit) {
+        return; // Milestone hit count not reached yet
     }
+
+    // Energy requirement check: must have at least the required bars
+    if (currentEnergy < step.requiredEnergy) {
+        return; // Natural energy not filled to required bars yet
+    }
+
+    // TRIGGER SPECIAL ABILITY PRECISELY AT THIS MILESTONE!
+    *(float *)((uintptr_t)mainSpecialInstance + 0x24) = 0.0f; // timeBlocked = 0
+    *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true;  // spShow = true
+
+    if (old_Main_Special_bzk != nullptr) {
+        old_Main_Special_bzk(mainSpecialInstance, false);
+    } else if (Main_Special_bzk != nullptr) {
+        Main_Special_bzk(mainSpecialInstance, false);
+    }
+
+    g_isSpecialActive = true;
+    g_lastActivatedAtNote = hits;
+    g_totalSpecialActivations++;
+    g_currentPathStep++; // Advance to next scheduled milestone!
+
+    LogDebug("⭐ [SmartSpecial] Path Step #%zu TRIGGERED at Hit #%d (Target: %d) | Combo: %d | Natural Energy: %d/%d bars | Total Activations: %d",
+             stepIdx + 1, hits, step.targetHit, combo, currentEnergy, step.requiredEnergy, g_totalSpecialActivations.load());
 }
 
 // 1. Hook Main_Scorer::cdc (RVA: 0x20c38a0)
@@ -715,9 +827,10 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
                 int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
                 if (fret >= 0 && fret < 5) {
                     TriggerFretFireEffect(fret);
+                    g_fretVisualTimer[fret] = 10;
+                    SetFretButtonActive(fret, true);
                     if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                         old_Main_Frets_byc(mainFretsInstance, fret, true);
-                        g_fretVisualTimer[fret] = 4;
                     }
                     g_autoHitsCount[fret]++;
                     g_totalAutoHits++;
@@ -765,6 +878,12 @@ void hook_Main_Notes_byv(void *instance) {
     pthread_mutex_lock(&g_chartNotesMutex);
     g_cachedChartNotes.clear();
     pthread_mutex_unlock(&g_chartNotesMutex);
+
+    pthread_mutex_lock(&g_pathMutex);
+    g_activePathMilestones.clear();
+    g_currentPathStep = 0;
+    pthread_mutex_unlock(&g_pathMutex);
+
     g_starPhraseInProgress = false;
     g_lastActivatedAtNote = -1;
     g_totalSpecialActivations = 0;
@@ -804,6 +923,7 @@ void hook_Main_Notes_bzc(void *instance, void *hm) {
         int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
         if (fret >= 0 && fret < 5) {
             g_fretSustaining[fret] = false;
+            g_fretVisualTimer[fret] = 0;
             if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                 old_Main_Frets_byc(mainFretsInstance, fret, false); // Release visual fret
             }
@@ -820,6 +940,16 @@ void hook_Main_Frets_byc(void *instance, int32_t fret, bool pressed) {
     if (instance != nullptr) {
         mainFretsInstance = instance;
     }
+
+    // Auto Play Visual Finger Touch:
+    // If our visual tap timer or sustain hold is active on this fret,
+    // intercept the game's internal touch polling (byb) from canceling the pressed state!
+    if (g_autoPlay.load() && fret >= 0 && fret < 5) {
+        if (!pressed && (g_fretVisualTimer[fret] > 0 || g_fretSustaining[fret].load())) {
+            pressed = true; // Maintain the visual finger touch press!
+        }
+    }
+
     if (old_Main_Frets_byc != nullptr) {
         old_Main_Frets_byc(instance, fret, pressed);
     }
@@ -872,10 +1002,11 @@ void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
                 // Trigger FIRE particle burst on the fret circle!
                 TriggerFretFireEffect(fret);
 
-                // Animate visual fret press
+                // Animate visual fret press: Natural finger touch (10 frames = ~160ms)
+                g_fretVisualTimer[fret] = 10;
+                SetFretButtonActive(fret, true);
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                     old_Main_Frets_byc(mainFretsInstance, fret, true);
-                    g_fretVisualTimer[fret] = 4; // Crisp visual tap animation
                 }
 
                 g_autoHitsCount[fret]++;
@@ -1103,6 +1234,8 @@ void *hack_thread(void *) {
     // Resolve Unity Component & Transform methods
     Component_get_transform = reinterpret_cast<void *(*)(void *)>(base + 0x3cac2f4);
     Transform_get_position = reinterpret_cast<Vector3 (*)(void *)>(base + 0x3cbd5c0);
+    GameObject_SetActive = reinterpret_cast<void (*)(void *, bool)>(base + 0x3caddcc);
+    LogDebug("Resolve GameObject::SetActive (0x3caddcc): %s", GameObject_SetActive != nullptr ? "SUCCESS" : "FAILED");
 
     // Resolve Fret Fire Particle Effect & Unity ParticleSystem methods
     Main_Frets_byh = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1f9d290);
@@ -1332,7 +1465,6 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             int32_t blue = g_blueHits.load();
             int32_t orange = g_orangeHits.load();
             int32_t hit = getNotesHit();
-            int32_t hitSP = getNotesHitSP();
             int32_t perd = getNotesPerdidas();
             int32_t err = getNotesErradas();
             int32_t miss = getNotesMiss();
@@ -1343,15 +1475,28 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             int32_t spActivations = g_totalSpecialActivations.load();
             bool spActive = g_isSpecialActive.load();
 
-            char statsMsg[600];
-            snprintf(statsMsg, sizeof(statsMsg),
-                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n⭐ SP: %s | Energy: %d/4\n⚡ Activations: %d | Total Notes: %d",
-                     green, red, yellow, blue, orange, hit, autoTotal, combo, miss,
-                     spActive ? "8x ACTIVE 🔥" : (g_autoSpecial.load() ? "READY (Smart Path)" : "OFF"),
-                     spEnergy, spActivations, total);
+            size_t curStep = g_currentPathStep.load();
+            size_t totalSteps = 0;
+            int32_t nextTargetHit = -1;
+            int32_t nextReqEnergy = 0;
+            pthread_mutex_lock(&g_pathMutex);
+            totalSteps = g_activePathMilestones.size();
+            if (curStep < totalSteps) {
+                nextTargetHit = g_activePathMilestones[curStep].targetHit;
+                nextReqEnergy = g_activePathMilestones[curStep].requiredEnergy;
+            }
+            pthread_mutex_unlock(&g_pathMutex);
 
-            LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, SPActive=%d, Miss=%d",
-                     hit, autoTotal, combo, spActive ? 1 : 0, miss);
+            char statsMsg[700];
+            snprintf(statsMsg, sizeof(statsMsg),
+                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n⭐ SP: %s | Energy: %d/4\n📋 Path Step: %zu/%zu | Target Hit: %d (Req: %d bars)\n⚡ Activations: %d | Total Notes: %d",
+                     green, red, yellow, blue, orange, hit, autoTotal, combo, miss,
+                     spActive ? "8x ACTIVE 🔥" : (g_autoSpecial.load() ? "READY (Deterministic Path)" : "OFF"),
+                     spEnergy, curStep, totalSteps, nextTargetHit, nextReqEnergy,
+                     spActivations, total);
+
+            LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, SPActive=%d, Miss=%d, Step=%zu/%zu",
+                     hit, autoTotal, combo, spActive ? 1 : 0, miss, curStep, totalSteps);
             Toast(env, obj, statsMsg, ToastLength::LENGTH_LONG);
             break;
         }
