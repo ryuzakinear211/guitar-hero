@@ -187,7 +187,9 @@ public class Menu {
                 "</html>", "text/html", "utf-8");
         wView.setBackgroundColor(0x00000000); //Transparent
         wView.setAlpha(ICON_ALPHA);
-        wView.getSettings().setAppCacheEnabled(true);
+        try {
+            wView.getSettings().getClass().getMethod("setAppCacheEnabled", boolean.class).invoke(wView.getSettings(), true);
+        } catch (Exception ignored) {}
         wView.setOnTouchListener(onTouchListener());
 
         //********** Settings icon **********
@@ -596,8 +598,11 @@ public class Menu {
         linearLayout.setOrientation(LinearLayout.VERTICAL);
         linearLayout.setGravity(Gravity.CENTER);
 
+        int defaultVal = (featNum == 12) ? 400 : min;
+        int currentProg = (loadedProg == 0) ? defaultVal : loadedProg;
+
         final TextView textView = new TextView(getContext);
-        textView.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + ((loadedProg == 0) ? min : loadedProg)));
+        textView.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + currentProg));
         textView.setTextColor(TEXT_COLOR_2);
 
         SeekBar seekBar = new SeekBar(getContext);
@@ -605,7 +610,7 @@ public class Menu {
         seekBar.setMax(max);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             seekBar.setMin(min); //setMin for Oreo and above
-        seekBar.setProgress((loadedProg == 0) ? min : loadedProg);
+        seekBar.setProgress(currentProg);
         seekBar.getThumb().setColorFilter(SeekBarColor, PorterDuff.Mode.SRC_ATOP);
         seekBar.getProgressDrawable().setColorFilter(SeekBarProgressColor, PorterDuff.Mode.SRC_ATOP);
         seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
@@ -1052,7 +1057,9 @@ public class Menu {
         wView.loadData(text, "text/html", "utf-8");
         wView.setBackgroundColor(0x00000000); //Transparent
         wView.setPadding(0, 5, 0, 5);
-        wView.getSettings().setAppCacheEnabled(false);
+        try {
+            wView.getSettings().getClass().getMethod("setAppCacheEnabled", boolean.class).invoke(wView.getSettings(), false);
+        } catch (Exception ignored) {}
         linLayout.addView(wView);
     }
 

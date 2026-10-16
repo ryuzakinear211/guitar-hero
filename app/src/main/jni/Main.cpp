@@ -127,6 +127,52 @@ static void *mainInstance = nullptr;        // Pointer to Main (MonoBehaviour)
 static void *mainNotesInstance = nullptr;   // Pointer to Main_Notes
 static void *mainScorerInstance = nullptr;  // Pointer to Main_Scorer
 static void *mainFretsInstance = nullptr;   // Pointer to Main_Frets
+static void *mainSpecialInstance = nullptr; // Pointer to Main_Special (MonoBehaviour)
+
+// =========================================================================
+// Auto Special Ability (Smart Pathing & Score Maximizer) State
+// =========================================================================
+static std::atomic<bool> g_autoSpecial{false};               // Master toggle: Auto Special Ability
+static std::atomic<int32_t> g_spPathTargetNote{400};        // Target Hit Note milestone (default 400 notes)
+static std::atomic<int32_t> g_spStrategy{0};                // 0: Smart Density & 8x Combo, 1: Milestone Note, 2: Always on 4x, 3: Instant Overdrive
+static std::atomic<bool> g_spAutoCharge{true};              // Auto Charge SP to full 4/4 (15s duration)
+static std::atomic<bool> g_forceTriggerSpecial{false};      // Force trigger request from UI button
+static std::atomic<bool> g_isSpecialActive{false};          // Live status: is Special active?
+static std::atomic<int32_t> g_currentCombo{0};              // Current live streak / combo count
+static std::atomic<int32_t> g_currentScore{0};              // Current total score
+static std::atomic<int32_t> g_lastActivatedAtNote{-1};      // Hit count at last activation to prevent double fire
+static std::atomic<int32_t> g_totalSpecialActivations{0};   // Total successful activations count
+static std::atomic<int32_t> g_specialEnergyLevel{0};        // Current SP energy (0..4)
+
+// Circular buffer for calculating real-time note density (notes per second)
+static const int DENSITY_BUFFER_SIZE = 16;
+static float g_recentHitTimes[DENSITY_BUFFER_SIZE] = {0};
+static int g_recentHitIndex = 0;
+static int g_recentHitCount = 0;
+static pthread_mutex_t g_pathMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void RecordHitTime(float time) {
+    pthread_mutex_lock(&g_pathMutex);
+    g_recentHitTimes[g_recentHitIndex % DENSITY_BUFFER_SIZE] = time;
+    g_recentHitIndex++;
+    if (g_recentHitCount < DENSITY_BUFFER_SIZE) {
+        g_recentHitCount++;
+    }
+    pthread_mutex_unlock(&g_pathMutex);
+}
+
+static float CalculateNoteDensity(float currentSongTime) {
+    pthread_mutex_lock(&g_pathMutex);
+    int count = 0;
+    for (int i = 0; i < g_recentHitCount; i++) {
+        float t = g_recentHitTimes[i];
+        if (currentSongTime - t >= 0.0f && currentSongTime - t <= 1.5f) {
+            count++;
+        }
+    }
+    pthread_mutex_unlock(&g_pathMutex);
+    return (float)count / 1.5f;
+}
 
 // Color-specific note hit counters:
 // Fret 0 = Green, 1 = Red, 2 = Yellow, 3 = Blue, 4 = Orange
@@ -216,13 +262,23 @@ static void resetAllNoteCounters() {
     }
     g_totalAutoHits = 0;
 
+    g_lastActivatedAtNote = -1;
+    g_totalSpecialActivations = 0;
+    g_currentCombo = 0;
+    g_currentScore = 0;
+    g_isSpecialActive = false;
+    pthread_mutex_lock(&g_pathMutex);
+    g_recentHitCount = 0;
+    g_recentHitIndex = 0;
+    pthread_mutex_unlock(&g_pathMutex);
+
     if (mainNotesInstance != nullptr) {
         *(int32_t *)((uintptr_t)mainNotesInstance + 0x64) = 0; // acertadas
         *(int32_t *)((uintptr_t)mainNotesInstance + 0x68) = 0; // acertadasSP
         *(int32_t *)((uintptr_t)mainNotesInstance + 0x6c) = 0; // erradas
         *(int32_t *)((uintptr_t)mainNotesInstance + 0x70) = 0; // perdidas
     }
-    LogDebug("User reset all note counters and auto-hit stats to 0");
+    LogDebug("User reset all note counters, auto-hit and special path stats to 0");
 }
 
 // =========================================================================
@@ -242,6 +298,14 @@ static Vector3 (*Transform_get_position)(void *transform) = nullptr;
 static void *(*Main_Frets_byh)(void *instance, int32_t fret) = nullptr;
 static void (*ParticleSystem_Play)(void *instance, void *dummy) = nullptr;
 
+// Function pointers for Special Ability & Obscured types
+static void (*Main_Special_bzk)(void *instance, bool a) = nullptr;
+static void (*old_Main_Special_bzk)(void *instance, bool a) = nullptr;
+static void (*Main_Special_bzl)(void *instance) = nullptr;
+static void (*old_Main_Special_bzl)(void *instance) = nullptr;
+static int32_t (*lx_op_Implicit_to_int)(void *obscuredInt) = nullptr;
+static void *(*lx_op_Implicit_from_int)(int32_t value) = nullptr;
+
 // Helper to trigger the fire particle burst on a fret circle
 static void TriggerFretFireEffect(int32_t fret) {
     if (fret < 0 || fret >= 5) return;
@@ -256,15 +320,166 @@ static void TriggerFretFireEffect(int32_t fret) {
 // Forward declaration of visual fret function pointer
 void (*old_Main_Frets_byc)(void *instance, int32_t fret, bool pressed) = nullptr;
 
+// Smart Path Finder: Evaluates note milestone, combo, and density to fire 8x Special
+static void CheckAndTriggerSmartSpecial(float songTime) {
+    bool force = g_forceTriggerSpecial.exchange(false);
+
+    if (!force && !g_autoSpecial.load()) {
+        return;
+    }
+
+    if (mainSpecialInstance == nullptr) {
+        if (mainInstance != nullptr) {
+            mainSpecialInstance = *(void **)((uintptr_t)mainInstance + 0xc0);
+        }
+        if (mainSpecialInstance == nullptr && mainNotesInstance != nullptr) {
+            mainSpecialInstance = *(void **)((uintptr_t)mainNotesInstance + 0x88);
+        }
+    }
+    if (mainSpecialInstance == nullptr) {
+        return;
+    }
+
+    // Check if Special is already active
+    bool active = *(bool *)((uintptr_t)mainSpecialInstance + 0x21);
+    g_isSpecialActive = active;
+    if (active && !force) {
+        return; // Already enjoying 8x multiplier!
+    }
+
+    // Read current energy from epe (0x40)
+    void *epe = *(void **)((uintptr_t)mainSpecialInstance + 0x40);
+    int32_t currentEnergy = 0;
+    if (epe != nullptr && lx_op_Implicit_to_int != nullptr) {
+        currentEnergy = lx_op_Implicit_to_int(epe);
+    }
+    g_specialEnergyLevel = currentEnergy;
+
+    int32_t hits = getNotesHit();
+    int32_t combo = g_currentCombo.load();
+    int32_t target = g_spPathTargetNote.load();
+    int32_t strategy = g_spStrategy.load();
+
+    bool trigger = force;
+
+    if (!trigger) {
+        // Prevent rapid re-triggering at the same hit count range (debounce 30 notes)
+        if (g_lastActivatedAtNote.load() >= 0 && (hits - g_lastActivatedAtNote.load()) < 30) {
+            return;
+        }
+
+        switch (strategy) {
+            case 0: { // Smart Density & 8x Combo (Highest Score Path)
+                // If a target note milestone is set (> 0), wait until note hits reach the target
+                if (target > 0 && hits < target) {
+                    break;
+                }
+                // Multiplier Golden Rule: Ensure combo >= 30 (4x multiplier, turns into 8x upon activation!)
+                if (combo >= 30 || (combo >= 15 && hits >= target)) {
+                    float density = CalculateNoteDensity(songTime);
+                    // Trigger on dense solo stream or milestone threshold
+                    if (density >= 1.5f || hits >= target) {
+                        trigger = true;
+                    }
+                }
+                break;
+            }
+            case 1: { // Milestone Note Target (Exact Target Milestone, e.g. Note 400)
+                if (hits >= target && combo >= 10) {
+                    trigger = true;
+                }
+                break;
+            }
+            case 2: { // Always on 4x Multiplier (Combo >= 30)
+                if (combo >= 30 && (target <= 0 || hits >= target)) {
+                    trigger = true;
+                }
+                break;
+            }
+            case 3: { // Instant Overdrive
+                if (target <= 0 || hits >= target) {
+                    trigger = true;
+                }
+                break;
+            }
+        }
+    }
+
+    if (trigger) {
+        // Energy preparation:
+        if (g_spAutoCharge.load() || force) {
+            // Boost to 4 bars (100% full bar = 15 seconds max 8x overdrive duration)
+            if (lx_op_Implicit_from_int != nullptr) {
+                void *fullEnergy = lx_op_Implicit_from_int(4);
+                *(void **)((uintptr_t)mainSpecialInstance + 0x40) = fullEnergy;
+                g_specialEnergyLevel = 4;
+            }
+        } else {
+            // Legit mode: requires at least 2 bars (50%) from game
+            if (currentEnergy < 2) {
+                return; // Energy not ready yet
+            }
+        }
+
+        // Unblock cooldown timer and ensure special UI is visible
+        *(float *)((uintptr_t)mainSpecialInstance + 0x24) = 0.0f; // timeBlocked = 0
+        *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true;  // spShow = true
+
+        // Execute activation via native bzk
+        if (old_Main_Special_bzk != nullptr) {
+            old_Main_Special_bzk(mainSpecialInstance, false);
+        } else if (Main_Special_bzk != nullptr) {
+            Main_Special_bzk(mainSpecialInstance, false);
+        }
+
+        g_isSpecialActive = true;
+        g_lastActivatedAtNote = hits;
+        g_totalSpecialActivations++;
+
+        LogDebug("⚡ [SmartSpecial] ACTIVATED at Note #%d (Target: %d) | Combo: %d | Density: %.2f nps | Total Activations: %d | 8x Multiplier Engaged!",
+                 hits, target, combo, CalculateNoteDensity(songTime), g_totalSpecialActivations.load());
+    }
+}
+
 // 1. Hook Main_Scorer::cdc (RVA: 0x20c38a0)
 void (*old_Main_Scorer_cdc)(void *instance, int32_t a, int32_t b) = nullptr;
 void hook_Main_Scorer_cdc(void *instance, int32_t a, int32_t b) {
     if (instance != nullptr) {
         mainScorerInstance = instance;
     }
+    g_currentCombo = a;
+    g_currentScore = b;
     if (old_Main_Scorer_cdc != nullptr) {
         return old_Main_Scorer_cdc(instance, a, b);
     }
+}
+
+// Hook Main_Special::bzk (RVA: 0x20bae98) - Special Ability Activation
+void hook_Main_Special_bzk(void *instance, bool a) {
+    if (instance != nullptr) {
+        mainSpecialInstance = instance;
+    }
+    if (old_Main_Special_bzk != nullptr) {
+        old_Main_Special_bzk(instance, a);
+    }
+    if (instance != nullptr) {
+        g_isSpecialActive = *(bool *)((uintptr_t)instance + 0x21);
+    } else {
+        g_isSpecialActive = true;
+    }
+    LogDebug("[SpecialHook] bzk invoked: isSpecialActive=%d", g_isSpecialActive.load() ? 1 : 0);
+}
+
+// Hook Main_Special::bzl (RVA: 0x20bb068) - Special Ability Deactivation
+void hook_Main_Special_bzl(void *instance) {
+    if (instance != nullptr) {
+        mainSpecialInstance = instance;
+    }
+    if (old_Main_Special_bzl != nullptr) {
+        old_Main_Special_bzl(instance);
+    }
+    g_isSpecialActive = false;
+    LogDebug("[SpecialHook] bzl invoked: Special ended, multiplier reverted to normal");
 }
 
 // 2. Hook Main_Notes::byy (RVA: 0x20b8fec)
@@ -299,6 +514,9 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
             }
         }
     }
+
+    RecordHitTime(b);
+    CheckAndTriggerSmartSpecial(b);
 
     if (old_Main_Notes_byy != nullptr) {
         old_Main_Notes_byy(instance, hm, b);
@@ -546,6 +764,12 @@ void hook_Main_Update(void *instance) {
             mainNotesInstance = notes;
         }
 
+        // Main.special: 0xc0
+        void *special = *(void **)((uintptr_t)instance + 0xc0);
+        if (special != nullptr) {
+            mainSpecialInstance = special;
+        }
+
         // Main.scorer: 0x110
         void *scorer = *(void **)((uintptr_t)instance + 0x110);
         if (scorer != nullptr) {
@@ -554,11 +778,18 @@ void hook_Main_Update(void *instance) {
 
         if (!g_mainCapturedLogged && notes != nullptr) {
             g_mainCapturedLogged = true;
-            LogDebug("Captured active instances: Main=0x%lx, Frets=0x%lx, Notes=0x%lx, Scorer=0x%lx",
+            LogDebug("Captured active instances: Main=0x%lx, Frets=0x%lx, Notes=0x%lx, Special=0x%lx, Scorer=0x%lx",
                      (unsigned long)mainInstance, (unsigned long)mainFretsInstance,
-                     (unsigned long)mainNotesInstance, (unsigned long)mainScorerInstance);
+                     (unsigned long)mainNotesInstance, (unsigned long)mainSpecialInstance, (unsigned long)mainScorerInstance);
         }
     }
+
+    // Evaluate Auto Special Ability smart pathing
+    float songTime = 0.0f;
+    if (mainInstance != nullptr) {
+        songTime = *(float *)((uintptr_t)mainInstance + 0x28);
+    }
+    CheckAndTriggerSmartSpecial(songTime);
 
     // Smart Move: Manage visual fret release timers
     for (int i = 0; i < 5; i++) {
@@ -756,7 +987,21 @@ void *hack_thread(void *) {
     HOOK("0x20f3148", hook_MenuMus_Setlist_cno, old_MenuMus_Setlist_cno);
     LogDebug("Hook MenuMus_Setlist::cno (0x20f3148): %s", old_MenuMus_Setlist_cno != nullptr ? "SUCCESS" : "FAILED");
 
-    LogDebug("All Guitar Hero Real-Time, Auto Play & Song Unlock hooks installed successfully!");
+    // 15. Resolve lx ObscuredInt helper functions
+    lx_op_Implicit_to_int = reinterpret_cast<int32_t (*)(void *)>(base + 0x210bc94);
+    lx_op_Implicit_from_int = reinterpret_cast<void *(*)(int32_t)>(base + 0x210d21c);
+
+    // 16. Hook Main_Special::bzk (0x20bae98) - Special Ability Activation
+    Main_Special_bzk = reinterpret_cast<void (*)(void *, bool)>(base + 0x20bae98);
+    HOOK("0x20bae98", hook_Main_Special_bzk, old_Main_Special_bzk);
+    LogDebug("Hook Main_Special::bzk (0x20bae98): %s", old_Main_Special_bzk != nullptr ? "SUCCESS" : "FAILED");
+
+    // 17. Hook Main_Special::bzl (0x20bb068) - Special Ability Deactivation
+    Main_Special_bzl = reinterpret_cast<void (*)(void *)>(base + 0x20bb068);
+    HOOK("0x20bb068", hook_Main_Special_bzl, old_Main_Special_bzl);
+    LogDebug("Hook Main_Special::bzl (0x20bb068): %s", old_Main_Special_bzl != nullptr ? "SUCCESS" : "FAILED");
+
+    LogDebug("All Guitar Hero Real-Time, Auto Play, Smart Special & Song Unlock hooks installed successfully!");
 
 #else 
     LogDebug("ARM32 architecture not supported for this 64-bit target");
@@ -769,12 +1014,13 @@ void *hack_thread(void *) {
 // JNI Method Implementations
 // =========================================================================
 
-// Returns [green, red, yellow, blue, orange, totalHits, totalMisses, totalCreated, totalAutoHits, autoPlay]
+// Returns [green, red, yellow, blue, orange, totalHits, totalMisses, totalCreated, totalAutoHits, autoPlay,
+//          specialActive, specialEnergy, currentCombo, currentScore, autoSpecialEnabled, pathTargetNote, totalSpecialActivations]
 jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
-    jintArray result = env->NewIntArray(10);
+    jintArray result = env->NewIntArray(17);
     if (!result) return nullptr;
 
-    jint fill[10];
+    jint fill[17];
     fill[0] = g_greenHits.load();
     fill[1] = g_redHits.load();
     fill[2] = g_yellowHits.load();
@@ -785,8 +1031,15 @@ jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
     fill[7] = getNotesTotalCreated();
     fill[8] = g_totalAutoHits.load();
     fill[9] = g_autoPlay.load() ? 1 : 0;
+    fill[10] = g_isSpecialActive.load() ? 1 : 0;
+    fill[11] = g_specialEnergyLevel.load();
+    fill[12] = g_currentCombo.load();
+    fill[13] = g_currentScore.load();
+    fill[14] = g_autoSpecial.load() ? 1 : 0;
+    fill[15] = g_spPathTargetNote.load();
+    fill[16] = g_totalSpecialActivations.load();
 
-    env->SetIntArrayRegion(result, 0, 10, fill);
+    env->SetIntArrayRegion(result, 0, 17, fill);
     return result;
 }
 
@@ -796,6 +1049,11 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     const char *features[] = {
             OBFUSCATE("Category_⚡ Automation"),
             OBFUSCATE("10_Toggle_Auto Play"),
+            OBFUSCATE("11_Toggle_Auto Special (Smart Path)"),
+            OBFUSCATE("12_SeekBar_SP Path Note Target_0_1000"),
+            OBFUSCATE("13_Spinner_SP Strategy_Smart Density & 8x Combo,Milestone Note Target,Always on 4x Multiplier,Instant Overdrive"),
+            OBFUSCATE("14_Toggle_Auto Charge SP (15s Max)"),
+            OBFUSCATE("15_Button_🔥 Trigger Special Now"),
 
             OBFUSCATE("Category_🎵 Songs & Unlocks"),
             OBFUSCATE("20_Toggle_Unlock All Songs"),
@@ -808,7 +1066,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>Auto Play: Hit otomatis tepat di lingkaran color.<br>Unlock All Songs: Buka seluruh lagu & akses VIP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>⭐ Auto Special: Smart path 8x score (Target default 400 note).<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -831,11 +1089,65 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
          boolean, str != NULL ? env->GetStringUTFChars(str, 0) : "");
 
     switch (featNum) {
-        // Single Auto Play Feature (OFF by default)
+        // Auto Play Feature (OFF by default)
         case 10:
             g_autoPlay = boolean;
             LogDebug("Auto Play toggled: %d", boolean);
             Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Play: AKTIF") : OBFUSCATE("⚡ Auto Play: NONAKTIF"), ToastLength::LENGTH_SHORT);
+            break;
+
+        // Auto Special Ability (Smart Path)
+        case 11:
+            g_autoSpecial = boolean;
+            LogDebug("Auto Special toggled: %d", boolean);
+            Toast(env, obj, boolean ? OBFUSCATE("⭐ Auto Special (Smart Path): AKTIF") : OBFUSCATE("⭐ Auto Special: NONAKTIF"), ToastLength::LENGTH_SHORT);
+            break;
+
+        // SP Path Note Target (SeekBar)
+        case 12: {
+            int32_t targetVal = value;
+            if (targetVal < 0) targetVal = 0;
+            g_spPathTargetNote = targetVal;
+            LogDebug("SP Path Note Target changed: %d", targetVal);
+            char targetMsg[128];
+            if (targetVal == 0) {
+                snprintf(targetMsg, sizeof(targetMsg), "🎯 SP Path Target: Tanpa Delay (Always on 4x Combo)");
+            } else {
+                snprintf(targetMsg, sizeof(targetMsg), "🎯 SP Path Target: Note #%d", targetVal);
+            }
+            Toast(env, obj, targetMsg, ToastLength::LENGTH_SHORT);
+            break;
+        }
+
+        // SP Strategy (Spinner)
+        case 13: {
+            g_spStrategy = value;
+            LogDebug("SP Strategy changed: %d", value);
+            const char *stratNames[] = {
+                "Smart Density & 8x Combo",
+                "Milestone Note Target",
+                "Always on 4x Multiplier",
+                "Instant Overdrive"
+            };
+            const char *selectedName = (value >= 0 && value < 4) ? stratNames[value] : "Custom";
+            char stratMsg[160];
+            snprintf(stratMsg, sizeof(stratMsg), "🧠 Strategy: %s", selectedName);
+            Toast(env, obj, stratMsg, ToastLength::LENGTH_SHORT);
+            break;
+        }
+
+        // Auto Charge SP (Toggle)
+        case 14:
+            g_spAutoCharge = boolean;
+            LogDebug("Auto Charge SP toggled: %d", boolean);
+            Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Charge SP: AKTIF (Full 15s)") : OBFUSCATE("⚡ Auto Charge SP: NONAKTIF (Legit 50%)"), ToastLength::LENGTH_SHORT);
+            break;
+
+        // Trigger Special Now (Button)
+        case 15:
+            g_forceTriggerSpecial = true;
+            LogDebug("User clicked: Trigger Special Now");
+            Toast(env, obj, OBFUSCATE("🔥 Special Ability Dinyalakan Sekarang!"), ToastLength::LENGTH_SHORT);
             break;
 
         // Unlock All Songs Feature (OFF by default)
@@ -886,21 +1198,27 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             int32_t miss = getNotesMiss();
             int32_t total = getNotesTotalCreated();
             int32_t autoTotal = g_totalAutoHits.load();
+            int32_t combo = g_currentCombo.load();
+            int32_t spTarget = g_spPathTargetNote.load();
+            int32_t spActivations = g_totalSpecialActivations.load();
+            bool spActive = g_isSpecialActive.load();
 
-            char statsMsg[450];
+            char statsMsg[600];
             snprintf(statsMsg, sizeof(statsMsg),
-                     "LIVE NOTE STATS:\n🟢 G: %d | 🔴 R: %d | 🟡 Y: %d\n🔵 B: %d | 🟠 O: %d\n🎯 Total Hit: %d (SP: %d)\n⚡ Total Auto Hit: %d\n❌ Miss: %d (Perd: %d, Err: %d)\nTotal Notes: %d",
-                     green, red, yellow, blue, orange, hit, hitSP, autoTotal, miss, perd, err, total);
+                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n⭐ SP: %s | Activations: %d\n🎯 Target Path: Note #%d\nTotal Notes: %d",
+                     green, red, yellow, blue, orange, hit, autoTotal, combo, miss,
+                     spActive ? "8x ACTIVE 🔥" : (g_autoSpecial.load() ? "READY (Pathing)" : "OFF"),
+                     spActivations, spTarget, total);
 
-            LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Miss=%d, G:%d R:%d Y:%d B:%d O:%d",
-                     hit, autoTotal, miss, green, red, yellow, blue, orange);
+            LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, SPActive=%d, Miss=%d",
+                     hit, autoTotal, combo, spActive ? 1 : 0, miss);
             Toast(env, obj, statsMsg, ToastLength::LENGTH_LONG);
             break;
         }
 
         case 3: // Button: Reset Note Counters
             resetAllNoteCounters();
-            Toast(env, obj, OBFUSCATE("Semua counter note & auto hit di-reset ke 0!"), ToastLength::LENGTH_SHORT);
+            Toast(env, obj, OBFUSCATE("Semua counter note, auto hit & special path di-reset ke 0!"), ToastLength::LENGTH_SHORT);
             break;
 
         case 4: // Button: Check Debug Log Path
