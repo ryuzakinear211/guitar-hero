@@ -119,6 +119,8 @@ static std::atomic<bool> g_autoPlay{false};       // Master switch for Auto Play
 // Per-fret internal trackers (frets 0..4)
 static std::atomic<int> g_fretVisualTimer[5]{0, 0, 0, 0, 0};
 static std::atomic<bool> g_fretSustaining[5]{false, false, false, false, false};
+static float g_fretSustainEndTime[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+static float g_fretSustainStartTime[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 static std::atomic<int32_t> g_autoHitsCount[5]{0, 0, 0, 0, 0};
 static std::atomic<int32_t> g_totalAutoHits{0};
 
@@ -128,6 +130,7 @@ static void *mainNotesInstance = nullptr;   // Pointer to Main_Notes
 static void *mainScorerInstance = nullptr;  // Pointer to Main_Scorer
 static void *mainFretsInstance = nullptr;   // Pointer to Main_Frets
 static void *mainSpecialInstance = nullptr; // Pointer to Main_Special (MonoBehaviour)
+static void SetFretButtonActive(int32_t fret, bool active);
 
 // =========================================================================
 // Auto Special Ability (Chart-Aware Smart Pathing) State
@@ -298,7 +301,10 @@ static void resetAllNoteCounters() {
     for (int i = 0; i < 5; i++) {
         g_fretVisualTimer[i] = 0;
         g_fretSustaining[i] = false;
+        g_fretSustainEndTime[i] = 0.0f;
+        g_fretSustainStartTime[i] = 0.0f;
         g_autoHitsCount[i] = 0;
+        SetFretButtonActive(i, false);
     }
     g_totalAutoHits = 0;
 
@@ -756,6 +762,7 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
     int32_t fret = -1;
     if (hm != nullptr) {
         fret = *(int32_t *)((uintptr_t)hm + 0x3c);
+        int32_t num = *(int32_t *)((uintptr_t)hm + 0x38);
         switch (fret) {
             case 0: g_greenHits++; break;
             case 1: g_redHits++; break;
@@ -765,14 +772,64 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
             default: g_otherHits++; break;
         }
 
+        // Count auto hits centrally here for 100% synchronization with total hits
+        if (g_autoPlay.load()) {
+            g_totalAutoHits++;
+            if (fret >= 0 && fret < 5) {
+                g_autoHitsCount[fret]++;
+            }
+        }
+
         // Track sustain notes (rastro: offset 0x28)
         if (fret >= 0 && fret < 5) {
             void *rastro = *(void **)((uintptr_t)hm + 0x28);
+            bool hasRastro = false;
             if (rastro != nullptr) {
                 // bool has: offset 0x20
-                bool hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
-                if (hasRastro) {
-                    g_fretSustaining[fret] = true;
+                hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
+            }
+
+            if (hasRastro) {
+                float noteDuration = 0.0f;
+                pthread_mutex_lock(&g_chartNotesMutex);
+                if (num >= 0 && num < (int)g_cachedChartNotes.size() && g_cachedChartNotes[num].num == num) {
+                    noteDuration = g_cachedChartNotes[num].duration;
+                } else {
+                    for (const auto &cn : g_cachedChartNotes) {
+                        if (cn.num == num) {
+                            noteDuration = cn.duration;
+                            break;
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&g_chartNotesMutex);
+
+                if (noteDuration <= 0.05f) {
+                    noteDuration = 0.5f; // Safe fallback duration if chart wasn't indexed
+                }
+
+                g_fretSustaining[fret] = true;
+                g_fretSustainStartTime[fret] = b;
+                g_fretSustainEndTime[fret] = b + noteDuration;
+
+                if (g_autoPlay.load()) {
+                    g_fretVisualTimer[fret] = 10;
+                    SetFretButtonActive(fret, true);
+                    if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                        old_Main_Frets_byc(mainFretsInstance, fret, true);
+                    }
+                }
+            } else {
+                g_fretSustaining[fret] = false;
+                g_fretSustainStartTime[fret] = 0.0f;
+                g_fretSustainEndTime[fret] = 0.0f;
+
+                if (g_autoPlay.load()) {
+                    g_fretVisualTimer[fret] = 10;
+                    SetFretButtonActive(fret, true);
+                    if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                        old_Main_Frets_byc(mainFretsInstance, fret, true);
+                    }
                 }
             }
         }
@@ -832,8 +889,6 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
                     if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                         old_Main_Frets_byc(mainFretsInstance, fret, true);
                     }
-                    g_autoHitsCount[fret]++;
-                    g_totalAutoHits++;
                     LogDebug("Auto Play 100%% Safety Hit: fret=%d, recovered unhit note at miss threshold", fret);
                 }
                 return; // Suppress miss completely - streak and combo preserved!
@@ -857,6 +912,13 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
         }
         if (fret >= 0 && fret < 5) {
             g_fretSustaining[fret] = false;
+            g_fretSustainStartTime[fret] = 0.0f;
+            g_fretSustainEndTime[fret] = 0.0f;
+            g_fretVisualTimer[fret] = 0;
+            SetFretButtonActive(fret, false);
+            if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                old_Main_Frets_byc(mainFretsInstance, fret, false);
+            }
         }
     }
 
@@ -904,7 +966,10 @@ void hook_Main_Notes_byv(void *instance) {
     for (int i = 0; i < 5; i++) {
         g_fretVisualTimer[i] = 0;
         g_fretSustaining[i] = false;
+        g_fretSustainEndTime[i] = 0.0f;
+        g_fretSustainStartTime[i] = 0.0f;
         g_autoHitsCount[i] = 0;
+        SetFretButtonActive(i, false);
     }
     g_totalAutoHits = 0;
 
@@ -923,7 +988,10 @@ void hook_Main_Notes_bzc(void *instance, void *hm) {
         int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
         if (fret >= 0 && fret < 5) {
             g_fretSustaining[fret] = false;
+            g_fretSustainEndTime[fret] = 0.0f;
+            g_fretSustainStartTime[fret] = 0.0f;
             g_fretVisualTimer[fret] = 0;
+            SetFretButtonActive(fret, false);
             if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                 old_Main_Frets_byc(mainFretsInstance, fret, false); // Release visual fret
             }
@@ -1009,8 +1077,6 @@ void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
                     old_Main_Frets_byc(mainFretsInstance, fret, true);
                 }
 
-                g_autoHitsCount[fret]++;
-                g_totalAutoHits++;
                 LogDebug("Auto Play HIT inside circle: fret=%d, z=%.2f, time=%.2f", fret, pos.z, time);
             }
         }
@@ -1102,11 +1168,27 @@ void hook_Main_Update(void *instance) {
     }
     CheckAndTriggerSmartSpecial(songTime);
 
-    // Smart Move: Manage visual fret release timers
+    // Smart Move: Manage visual fret release and sustain timers
     for (int i = 0; i < 5; i++) {
+        // A. Release sustain hold when note tail finishes
+        if (g_fretSustaining[i].load()) {
+            if (songTime >= g_fretSustainEndTime[i] || (songTime - g_fretSustainStartTime[i]) > 4.5f || (songTime < g_fretSustainStartTime[i] - 0.5f)) {
+                g_fretSustaining[i] = false;
+                g_fretSustainEndTime[i] = 0.0f;
+                g_fretSustainStartTime[i] = 0.0f;
+                g_fretVisualTimer[i] = 0;
+                SetFretButtonActive(i, false);
+                if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                    old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret cleanly
+                }
+            }
+        }
+
+        // B. Release tap timer for standard notes
         if (g_fretVisualTimer[i] > 0) {
             int t = --g_fretVisualTimer[i];
             if (t == 0 && !g_fretSustaining[i].load()) {
+                SetFretButtonActive(i, false);
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                     old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret
                 }
@@ -1345,13 +1427,18 @@ jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
     jintArray result = env->NewIntArray(16);
     if (!result) return nullptr;
 
+    int32_t totalHits = getNotesHit();
+    if (g_autoPlay.load() && totalHits > g_totalAutoHits.load()) {
+        g_totalAutoHits = totalHits;
+    }
+
     jint fill[16];
     fill[0] = g_greenHits.load();
     fill[1] = g_redHits.load();
     fill[2] = g_yellowHits.load();
     fill[3] = g_blueHits.load();
     fill[4] = g_orangeHits.load();
-    fill[5] = getNotesHit();
+    fill[5] = totalHits;
     fill[6] = getNotesMiss();
     fill[7] = getNotesTotalCreated();
     fill[8] = g_totalAutoHits.load();

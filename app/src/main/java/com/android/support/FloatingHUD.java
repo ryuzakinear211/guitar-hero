@@ -102,6 +102,7 @@ public class FloatingHUD {
         mCard = new LinearLayout(mContext);
         mCard.setOrientation(LinearLayout.VERTICAL);
         mCard.setPadding(dp(10), dp(8), dp(10), dp(8));
+        mCard.setMinimumWidth(dp(195));
 
         // Dark sleek glassmorphism background with cyan accent border
         GradientDrawable bg = new GradientDrawable();
@@ -150,32 +151,46 @@ public class FloatingHUD {
         divider1.setLayoutParams(divParams1);
         mCard.addView(divider1);
 
-        // Row 1: Green, Red, Yellow
+        // Row 1: Green, Red, Yellow (equal width 1.0f weight to prevent clipping)
         LinearLayout row1 = new LinearLayout(mContext);
         row1.setOrientation(LinearLayout.HORIZONTAL);
         row1.setGravity(Gravity.CENTER_VERTICAL);
+        row1.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         tvGreen = createBadgeView("🟢 G: 0", "#00E676");
         tvRed = createBadgeView("🔴 R: 0", "#FF5252");
         tvYellow = createBadgeView("🟡 Y: 0", "#FFEA00");
+
+        LinearLayout.LayoutParams badgeParams1 = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+        tvGreen.setLayoutParams(badgeParams1);
+        tvRed.setLayoutParams(badgeParams1);
+        tvYellow.setLayoutParams(badgeParams1);
 
         row1.addView(tvGreen);
         row1.addView(tvRed);
         row1.addView(tvYellow);
         mCard.addView(row1);
 
-        // Row 2: Blue, Orange, Miss
+        // Row 2: Blue, Orange, Miss (equal width 1.0f weight)
         LinearLayout row2 = new LinearLayout(mContext);
         row2.setOrientation(LinearLayout.HORIZONTAL);
         row2.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams row2Params = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         row2Params.setMargins(0, dp(4), 0, dp(4));
         row2.setLayoutParams(row2Params);
 
         tvBlue = createBadgeView("🔵 B: 0", "#40C4FF");
         tvOrange = createBadgeView("🟠 O: 0", "#FF9100");
         tvMiss = createBadgeView("❌ Miss: 0", "#FF1744");
+
+        LinearLayout.LayoutParams badgeParams2 = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+        tvBlue.setLayoutParams(badgeParams2);
+        tvOrange.setLayoutParams(badgeParams2);
+        tvMiss.setLayoutParams(badgeParams2);
 
         row2.addView(tvBlue);
         row2.addView(tvOrange);
@@ -252,9 +267,10 @@ public class FloatingHUD {
         TextView tv = new TextView(mContext);
         tv.setText(text);
         tv.setTextColor(Color.parseColor(colorHex));
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         tv.setTypeface(Typeface.DEFAULT_BOLD);
-        tv.setPadding(dp(4), dp(2), dp(6), dp(2));
+        tv.setSingleLine(true);
+        tv.setPadding(dp(2), dp(2), dp(2), dp(2));
         return tv;
     }
 
@@ -372,8 +388,10 @@ public class FloatingHUD {
         tvOrange.setText("🟠 O: " + orange);
         tvMiss.setText(Html.fromHtml("❌ Miss: <b>" + miss + "</b>"));
 
-        if (autoHits > 0) {
-            tvTotal.setText(Html.fromHtml("🎯 Hit: <b><font color='#00E5FF'>" + total + "</font></b> <small><font color='#76FF03'>(" + autoHits + " auto)</font></small>"));
+        // When Auto Play is active, autoHits is completely synchronized with total hit count
+        int displayAutoHits = (autoMaster == 1 || autoHits >= total) ? total : autoHits;
+        if (displayAutoHits > 0) {
+            tvTotal.setText(Html.fromHtml("🎯 Hit: <b><font color='#00E5FF'>" + total + "</font></b> <small><font color='#76FF03'>(" + displayAutoHits + " auto)</font></small>"));
         } else {
             tvTotal.setText(Html.fromHtml("🎯 Hit: <b><font color='#00E5FF'>" + total + "</font></b>"));
         }
