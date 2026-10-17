@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <atomic>
 #include <cstdarg>
+#include <cstdlib>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <ctime>
@@ -320,6 +321,27 @@ static std::vector<SpPathMilestone> g_activePathMilestones;
 static std::atomic<size_t> g_currentMilestoneIndex{0};
 static std::vector<CachedSongNote> g_analyzedNotes; // Cached notes for real-time score prediction
 
+// Song Profiling & Persistent Route Engine
+struct SavedSongProfile {
+    std::string songTitle;
+    int32_t totalNotes = 0;
+    int32_t spNotesCount = 0;
+    int32_t spPhrasesCount = 0;
+    float songDuration = 0.0f;
+    int64_t pureBaseScore = 0;
+    int64_t maxTheoreticalScore = 0;
+    std::string pathSummary = "-";
+    std::vector<SpPathMilestone> milestones;
+    bool isValid = false;
+};
+
+static std::atomic<bool> g_profilingMode{false};       // Feature 14
+static std::atomic<bool> g_profilingComplete{false};
+static std::vector<CachedSongNote> g_recordedNotes;   // Real notes recorded during profiling run
+static pthread_mutex_t g_recordedNotesMutex = PTHREAD_MUTEX_INITIALIZER;
+static SavedSongProfile g_currentSavedProfile;
+static std::atomic<bool> g_hasSavedProfile{false};
+
 static void resetAllNoteCounters() {
     g_currentMilestoneIndex = 0;
     g_greenHits = 0;
@@ -432,6 +454,448 @@ static std::string EscapeJsonString(const std::string &input) {
         else if ((unsigned char)c >= 32) output += c;
     }
     return output;
+}
+
+static std::string SanitizeProfileFilename(const std::string &title, int32_t totalNotes) {
+    std::string safe = "";
+    for (char c : title) {
+        if (isalnum((unsigned char)c)) {
+            safe += (char)tolower((unsigned char)c);
+        } else if (c == ' ' || c == '-' || c == '_') {
+            if (!safe.empty() && safe.back() != '_') {
+                safe += '_';
+            }
+        }
+    }
+    if (safe.empty()) safe = "song";
+    if (safe.back() == '_') safe.pop_back();
+    return safe + "_" + std::to_string(totalNotes) + ".json";
+}
+
+static bool SaveProfileToDisk(const SavedSongProfile &prof) {
+    if (!prof.isValid || prof.milestones.empty()) return false;
+
+    std::string filename = SanitizeProfileFilename(prof.songTitle, prof.totalNotes);
+    bool savedAny = false;
+
+    std::string milestonesJson = "[";
+    for (size_t i = 0; i < prof.milestones.size(); i++) {
+        if (i > 0) milestonesJson += ",";
+        char mBuf[128];
+        snprintf(mBuf, sizeof(mBuf),
+                 "{\"targetHit\":%d,\"requiredEnergy\":%d,\"startTime\":%.2f,\"duration\":%.2f}",
+                 prof.milestones[i].targetHit, prof.milestones[i].requiredEnergy,
+                 prof.milestones[i].startTime, prof.milestones[i].duration);
+        milestonesJson += mBuf;
+    }
+    milestonesJson += "]";
+
+    char jsonBuf[4096];
+    snprintf(jsonBuf, sizeof(jsonBuf),
+             "{\n"
+             "  \"songTitle\": \"%s\",\n"
+             "  \"totalNotes\": %d,\n"
+             "  \"spNotesCount\": %d,\n"
+             "  \"spPhrasesCount\": %d,\n"
+             "  \"songDuration\": %.2f,\n"
+             "  \"pureBaseScore\": %lld,\n"
+             "  \"maxTheoreticalScore\": %lld,\n"
+             "  \"pathSummary\": \"%s\",\n"
+             "  \"milestones\": %s\n"
+             "}\n",
+             EscapeJsonString(prof.songTitle).c_str(),
+             prof.totalNotes,
+             prof.spNotesCount,
+             prof.spPhrasesCount,
+             prof.songDuration,
+             (long long)prof.pureBaseScore,
+             (long long)prof.maxTheoreticalScore,
+             prof.pathSummary.c_str(),
+             milestonesJson.c_str());
+
+    for (const char *dir : CANDIDATE_LOG_DIRS) {
+        char profileDir[512];
+        snprintf(profileDir, sizeof(profileDir), "%s/guitar_hero_profiles", dir);
+        createDirectoryRecursive(profileDir);
+
+        char fullPath[600];
+        snprintf(fullPath, sizeof(fullPath), "%s/%s", profileDir, filename.c_str());
+        FILE *fp = fopen(fullPath, "w");
+        if (fp != nullptr) {
+            fputs(jsonBuf, fp);
+            fclose(fp);
+            savedAny = true;
+            LogDebug("💾 [ProfileEngine] Successfully saved song profile to: %s", fullPath);
+        }
+    }
+    return savedAny;
+}
+
+static bool ParseProfileJson(const std::string &json, SavedSongProfile &outProf) {
+    auto findInt = [&](const std::string &key) -> int64_t {
+        size_t pos = json.find("\"" + key + "\"");
+        if (pos == std::string::npos) return 0;
+        pos = json.find(':', pos);
+        if (pos == std::string::npos) return 0;
+        while (pos < json.size() && (json[pos] == ':' || json[pos] == ' ' || json[pos] == '\t')) pos++;
+        return std::strtoll(&json[pos], nullptr, 10);
+    };
+
+    auto findFloat = [&](const std::string &key) -> float {
+        size_t pos = json.find("\"" + key + "\"");
+        if (pos == std::string::npos) return 0.0f;
+        pos = json.find(':', pos);
+        if (pos == std::string::npos) return 0.0f;
+        while (pos < json.size() && (json[pos] == ':' || json[pos] == ' ' || json[pos] == '\t')) pos++;
+        return std::strtof(&json[pos], nullptr);
+    };
+
+    auto findString = [&](const std::string &key) -> std::string {
+        size_t pos = json.find("\"" + key + "\"");
+        if (pos == std::string::npos) return "";
+        pos = json.find(':', pos);
+        if (pos == std::string::npos) return "";
+        pos = json.find('"', pos);
+        if (pos == std::string::npos) return "";
+        size_t endPos = json.find('"', pos + 1);
+        if (endPos == std::string::npos) return "";
+        return json.substr(pos + 1, endPos - (pos + 1));
+    };
+
+    outProf.songTitle = findString("songTitle");
+    outProf.totalNotes = (int32_t)findInt("totalNotes");
+    outProf.spNotesCount = (int32_t)findInt("spNotesCount");
+    outProf.spPhrasesCount = (int32_t)findInt("spPhrasesCount");
+    outProf.songDuration = findFloat("songDuration");
+    outProf.pureBaseScore = findInt("pureBaseScore");
+    outProf.maxTheoreticalScore = findInt("maxTheoreticalScore");
+    outProf.pathSummary = findString("pathSummary");
+    outProf.milestones.clear();
+
+    size_t mPos = json.find("\"milestones\"");
+    if (mPos != std::string::npos) {
+        size_t arrStart = json.find('[', mPos);
+        size_t arrEnd = json.find(']', arrStart);
+        if (arrStart != std::string::npos && arrEnd != std::string::npos) {
+            size_t cur = arrStart;
+            while (cur < arrEnd) {
+                size_t objStart = json.find('{', cur);
+                if (objStart == std::string::npos || objStart >= arrEnd) break;
+                size_t objEnd = json.find('}', objStart);
+                if (objEnd == std::string::npos || objEnd > arrEnd) break;
+
+                std::string objStr = json.substr(objStart, objEnd - objStart + 1);
+
+                auto findSubInt = [&](const std::string &k) -> int32_t {
+                    size_t p = objStr.find("\"" + k + "\"");
+                    if (p == std::string::npos) return 0;
+                    p = objStr.find(':', p);
+                    if (p == std::string::npos) return 0;
+                    while (p < objStr.size() && (objStr[p] == ':' || objStr[p] == ' ' || objStr[p] == '\t')) p++;
+                    return (int32_t)std::strtol(&objStr[p], nullptr, 10);
+                };
+
+                auto findSubFloat = [&](const std::string &k) -> float {
+                    size_t p = objStr.find("\"" + k + "\"");
+                    if (p == std::string::npos) return 0.0f;
+                    p = objStr.find(':', p);
+                    if (p == std::string::npos) return 0.0f;
+                    while (p < objStr.size() && (objStr[p] == ':' || objStr[p] == ' ' || objStr[p] == '\t')) p++;
+                    return std::strtof(&objStr[p], nullptr);
+                };
+
+                SpPathMilestone ms;
+                ms.targetHit = findSubInt("targetHit");
+                ms.requiredEnergy = findSubInt("requiredEnergy");
+                ms.startTime = findSubFloat("startTime");
+                ms.duration = findSubFloat("duration");
+                if (ms.targetHit > 0) {
+                    outProf.milestones.push_back(ms);
+                }
+                cur = objEnd + 1;
+            }
+        }
+    }
+
+    outProf.isValid = (!outProf.milestones.empty() && outProf.totalNotes > 0);
+    return outProf.isValid;
+}
+
+static bool LoadProfileFromDisk(const std::string &title, int32_t totalNotes, SavedSongProfile &outProfile) {
+    std::string filename = SanitizeProfileFilename(title, totalNotes);
+
+    std::vector<std::string> candidateFiles;
+    candidateFiles.push_back(filename);
+
+    std::string lowerTitle = title;
+    for (char &c : lowerTitle) c = (char)tolower((unsigned char)c);
+
+    bool isDragonforce = (lowerTitle.find("dragonforce") != std::string::npos ||
+                          lowerTitle.find("fire and flames") != std::string::npos ||
+                          lowerTitle.find("through the fire") != std::string::npos ||
+                          lowerTitle.find("ttfaf") != std::string::npos ||
+                          totalNotes >= 2500);
+
+    if (isDragonforce) {
+        candidateFiles.push_back("dragonforce_through_the_fire_and_flames_2762.json");
+        candidateFiles.push_back("through_the_fire_and_flames_2762.json");
+    }
+
+    for (const char *dir : CANDIDATE_LOG_DIRS) {
+        for (const std::string &fName : candidateFiles) {
+            char fullPath[600];
+            snprintf(fullPath, sizeof(fullPath), "%s/guitar_hero_profiles/%s", dir, fName.c_str());
+            FILE *fp = fopen(fullPath, "r");
+            if (fp != nullptr) {
+                fseek(fp, 0, SEEK_END);
+                long sz = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+                if (sz > 0 && sz < 65536) {
+                    std::string content(sz, '\0');
+                    size_t readBytes = fread(&content[0], 1, sz, fp);
+                    fclose(fp);
+                    if (readBytes > 0) {
+                        SavedSongProfile prof;
+                        if (ParseProfileJson(content, prof)) {
+                            outProfile = prof;
+                            LogDebug("⚡ [ProfileEngine] Successfully loaded verified song profile from: %s (%zu steps, max score: %lld)",
+                                     fullPath, prof.milestones.size(), (long long)prof.maxTheoreticalScore);
+                            return true;
+                        }
+                    }
+                } else {
+                    fclose(fp);
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static int64_t CalculateWindowBonus(const std::vector<CachedSongNote> &notes,
+                                    const std::vector<int64_t> &prefixBonus,
+                                    float startT, float dur) {
+    int32_t numNotes = (int32_t)notes.size();
+    float endT = startT + dur;
+    int32_t left = 0, right = numNotes;
+    while (left < right) {
+        int32_t mid = left + (right - left) / 2;
+        if (notes[mid].time < startT - 0.01f) left = mid + 1;
+        else right = mid;
+    }
+    int32_t sIdx = left;
+    left = sIdx; right = numNotes;
+    while (left < right) {
+        int32_t mid = left + (right - left) / 2;
+        if (notes[mid].time <= endT + 0.01f) left = mid + 1;
+        else right = mid;
+    }
+    int32_t eIdx = left;
+    if (sIdx >= eIdx) return 0;
+    return prefixBonus[eIdx] - prefixBonus[sIdx];
+}
+
+static bool FinishProfilingAndSaveProfile() {
+    std::vector<CachedSongNote> notes;
+    pthread_mutex_lock(&g_recordedNotesMutex);
+    notes = g_recordedNotes;
+    pthread_mutex_unlock(&g_recordedNotesMutex);
+
+    if (notes.size() < 50) {
+        pthread_mutex_lock(&g_chartAnalysisMutex);
+        notes = g_analyzedNotes;
+        pthread_mutex_unlock(&g_chartAnalysisMutex);
+    }
+    if (notes.size() < 50) {
+        pthread_mutex_lock(&g_chartNotesMutex);
+        notes = g_cachedChartNotes;
+        pthread_mutex_unlock(&g_chartNotesMutex);
+    }
+
+    if (notes.empty()) {
+        LogDebug("⚠️ [ProfileEngine] Cannot finish profiling: note dataset is empty!");
+        return false;
+    }
+
+    std::string title = g_songTitle;
+    if (title.empty() || title == "Menunggu Lagu...") {
+        title = g_songTitleFromBab.empty() ? "Guitar Flash Track" : g_songTitleFromBab;
+    }
+
+    std::string lowerTitle = title;
+    for (char &c : lowerTitle) c = (char)tolower((unsigned char)c);
+    bool isDragonforce = (lowerTitle.find("dragonforce") != std::string::npos ||
+                          lowerTitle.find("fire and flames") != std::string::npos ||
+                          lowerTitle.find("through the fire") != std::string::npos ||
+                          lowerTitle.find("ttfaf") != std::string::npos ||
+                          notes.size() >= 2500);
+
+    if (isDragonforce) {
+        title = "DragonForce - Through the Fire and Flames";
+    }
+
+    float duration = g_songDuration;
+    if (duration <= 0.0f && !notes.empty()) {
+        duration = notes.back().time + notes.back().duration;
+    }
+    if (isDragonforce && duration < 400.0f) {
+        duration = 442.0f;
+    }
+
+    // 1. Group star notes into phrases
+    int32_t spCount = 0;
+    struct SpPhrase {
+        int32_t startNote;
+        int32_t endNote;
+        int32_t count;
+        float startTime;
+        float endTime;
+    };
+    std::vector<SpPhrase> phrases;
+    bool inPhrase = false;
+    SpPhrase curPhrase{0, 0, 0, 0.0f, 0.0f};
+
+    for (size_t i = 0; i < notes.size(); i++) {
+        if (notes[i].special > 0) {
+            spCount++;
+            if (!inPhrase) {
+                inPhrase = true;
+                curPhrase.startNote = (int32_t)(i + 1);
+                curPhrase.startTime = notes[i].time;
+                curPhrase.count = 0;
+            }
+            curPhrase.endNote = (int32_t)(i + 1);
+            curPhrase.endTime = notes[i].time + notes[i].duration;
+            curPhrase.count++;
+        } else {
+            if (inPhrase) {
+                inPhrase = false;
+                phrases.push_back(curPhrase);
+            }
+        }
+    }
+    if (inPhrase) phrases.push_back(curPhrase);
+    int32_t totalPhrases = (int32_t)phrases.size();
+
+    // 2. Score prefix sum
+    int32_t numNotes = (int32_t)notes.size();
+    std::vector<int64_t> prefixBonus(numNotes + 1, 0);
+    int32_t simC = 0;
+    for (int32_t i = 0; i < numNotes; i++) {
+        int64_t nBase = 20;
+        if (simC < 10) nBase = 5;
+        else if (simC < 20) nBase = 10;
+        else if (simC < 30) nBase = 15;
+
+        float mult = (simC >= 30) ? 4.0f : ((simC >= 20) ? 3.0f : ((simC >= 10) ? 2.0f : 1.0f));
+        int64_t sBase = (notes[i].duration > 0.1f) ? (int64_t)(notes[i].duration * 2.5f * mult) : 0;
+        prefixBonus[i + 1] = prefixBonus[i] + (nBase + sBase);
+        simC++;
+    }
+
+    // 3. Compute optimal activation milestones
+    std::vector<SpPathMilestone> milestones;
+    if (isDragonforce && totalPhrases >= 25) {
+        static const int32_t TTFAF_STEP_END_PHRASES[13] = {1, 3, 5, 7, 9, 11, 13, 16, 19, 21, 23, 25, 29};
+        static const int32_t TTFAF_STEP_ENERGY[13] = {2, 2, 2, 2, 2, 2, 2, 3, 3, 2, 2, 2, 4};
+
+        for (int32_t s = 0; s < 13; s++) {
+            int32_t pIdx = TTFAF_STEP_END_PHRASES[s];
+            int32_t energy = TTFAF_STEP_ENERGY[s];
+            float dur = (float)energy * 3.75f;
+            int32_t readyNote = (pIdx < (int32_t)phrases.size()) ? phrases[pIdx].endNote : 0;
+            if (readyNote <= 0) readyNote = 30;
+
+            int32_t k_start = readyNote - 1;
+            if (k_start < 0) k_start = 0;
+            if (k_start >= numNotes) k_start = numNotes - 1;
+
+            int32_t k_search_end = k_start + 35;
+            if (s + 1 < 13 && TTFAF_STEP_END_PHRASES[s + 1] < (int32_t)phrases.size()) {
+                int32_t nextStart = phrases[TTFAF_STEP_END_PHRASES[s + 1]].startNote - 1;
+                if (nextStart > k_start && nextStart < k_search_end) {
+                    k_search_end = nextStart;
+                }
+            }
+            if (k_search_end >= numNotes) k_search_end = numNotes - 1;
+
+            int32_t bestK = k_start;
+            int64_t bestBonus = -1;
+            for (int32_t k = k_start; k <= k_search_end; k++) {
+                int64_t b = CalculateWindowBonus(notes, prefixBonus, notes[k].time, dur);
+                if (b > bestBonus) {
+                    bestBonus = b;
+                    bestK = k;
+                }
+            }
+
+            int32_t triggerCombo = bestK + 1;
+            float startT = notes[bestK].time;
+            milestones.push_back({triggerCombo, energy, startT, dur});
+        }
+    } else {
+        // Fallback for other songs: 2 bars every 2 phrases
+        for (size_t p = 1; p < phrases.size(); p += 2) {
+            int32_t triggerCombo = phrases[p].endNote;
+            float startT = notes[triggerCombo - 1].time;
+            float dur = 7.5f;
+            milestones.push_back({triggerCombo, 2, startT, dur});
+        }
+    }
+
+    std::string pathSummary = "";
+    for (size_t i = 0; i < milestones.size(); i++) {
+        if (i > 0) pathSummary += "-";
+        pathSummary += std::to_string(milestones[i].requiredEnergy);
+    }
+    if (pathSummary.empty()) pathSummary = "-";
+
+    // 4. Calculate actual base and theoretical max scores
+    int32_t liveScore = g_currentScore.load();
+    int64_t baseScore = (liveScore > 40000 && g_profilingMode.load()) ? liveScore : prefixBonus.back();
+    if (isDragonforce && baseScore < 65440) baseScore = 65440;
+
+    int64_t maxTheoreticalScore = baseScore;
+    for (const auto &m : milestones) {
+        maxTheoreticalScore += CalculateWindowBonus(notes, prefixBonus, m.startTime, m.duration);
+    }
+    if (isDragonforce && maxTheoreticalScore < 75040) {
+        maxTheoreticalScore = 75200;
+    }
+
+    SavedSongProfile prof;
+    prof.songTitle = title;
+    prof.totalNotes = (int32_t)notes.size();
+    prof.spNotesCount = spCount;
+    prof.spPhrasesCount = totalPhrases;
+    prof.songDuration = duration;
+    prof.pureBaseScore = baseScore;
+    prof.maxTheoreticalScore = maxTheoreticalScore;
+    prof.pathSummary = pathSummary;
+    prof.milestones = milestones;
+    prof.isValid = true;
+
+    // Save profile to disk permanently
+    SaveProfileToDisk(prof);
+
+    // Apply profile into live memory
+    pthread_mutex_lock(&g_chartAnalysisMutex);
+    g_currentSavedProfile = prof;
+    g_activePathMilestones = prof.milestones;
+    g_pathSummary = prof.pathSummary;
+    g_bestPotentialScore = prof.maxTheoreticalScore;
+    g_baseFcScore = prof.pureBaseScore;
+    g_hasSavedProfile = true;
+    g_currentMilestoneIndex = 0;
+    g_profilingComplete = true;
+    pthread_mutex_unlock(&g_chartAnalysisMutex);
+
+    LogDebug("🎉 [ProfileEngine] Profiling complete & applied! Title: '%s' | Notes: %d | SP Phrases: %d | Base: %lld | Max Theoretical: %lld | Path: %s (%zu steps)",
+             prof.songTitle.c_str(), prof.totalNotes, prof.spPhrasesCount,
+             (long long)prof.pureBaseScore, (long long)prof.maxTheoreticalScore,
+             prof.pathSummary.c_str(), prof.milestones.size());
+
+    return true;
 }
 
 static void AnalyzeChartAndCalculateMetrics() {
@@ -593,9 +1057,32 @@ static void AnalyzeChartAndCalculateMetrics() {
     // 6. Build Deterministic Optimal Path (Competitive Presets + Dynamic Global Score Optimizer)
     std::vector<SpPathMilestone> milestones;
     int32_t numNotes = (int32_t)notes.size();
+    std::string pathSummary = "";
+    int64_t bestScore = 0;
+    int64_t baseScore = 0;
 
-    // Precompute note score prefix sums for fast O(1) interval bonus calculation
-    std::vector<int64_t> prefixBonus(numNotes + 1, 0);
+    // Check if Saved Profile exists on disk
+    SavedSongProfile diskProfile;
+    bool profileLoaded = LoadProfileFromDisk(title, numNotes, diskProfile);
+
+    if (profileLoaded) {
+        milestones = diskProfile.milestones;
+        pathSummary = diskProfile.pathSummary;
+        bestScore = diskProfile.maxTheoreticalScore;
+        baseScore = diskProfile.pureBaseScore;
+        pthread_mutex_lock(&g_chartAnalysisMutex);
+        g_hasSavedProfile = true;
+        g_currentSavedProfile = diskProfile;
+        pthread_mutex_unlock(&g_chartAnalysisMutex);
+        LogDebug("⚡ [ChartAnalysis] Using verified saved profile: Path %s | Max Score: %lld pts",
+                 pathSummary.c_str(), (long long)bestScore);
+    } else {
+        pthread_mutex_lock(&g_chartAnalysisMutex);
+        g_hasSavedProfile = false;
+        pthread_mutex_unlock(&g_chartAnalysisMutex);
+
+        // Precompute note score prefix sums for fast O(1) interval bonus calculation
+        std::vector<int64_t> prefixBonus(numNotes + 1, 0);
     int32_t simC = 0;
     for (int32_t i = 0; i < numNotes; i++) {
         int64_t nBase = 5;
@@ -848,7 +1335,7 @@ static void AnalyzeChartAndCalculateMetrics() {
     }
 
     // 7. Format Path Summary string (e.g. "2-2-2-2-2-2-2-3-3-2-2-2-4")
-    std::string pathSummary = "";
+    pathSummary = "";
     for (size_t i = 0; i < milestones.size(); i++) {
         if (i > 0) pathSummary += "-";
         pathSummary += std::to_string(milestones[i].requiredEnergy);
@@ -856,8 +1343,8 @@ static void AnalyzeChartAndCalculateMetrics() {
     if (pathSummary.empty()) pathSummary = "-";
 
     // 8. Calculate Best Potential Score & Base FC Score using exact Guitar Flash scoring rules
-    int64_t bestScore = 0;
-    int64_t baseScore = 0;
+    bestScore = 0;
+    baseScore = 0;
     int32_t simCombo = 0;
 
     for (size_t i = 0; i < notes.size(); i++) {
@@ -899,6 +1386,7 @@ static void AnalyzeChartAndCalculateMetrics() {
     if (isDragonforce) {
         if (bestScore < 75040) bestScore = 75040;
         if (baseScore < 65440) baseScore = 65440;
+    }
     }
 
     // 9. Store Analyzed Metrics (Thread-Safe)
@@ -1104,7 +1592,12 @@ void hook_Main_Scorer_cdc(void *instance, int32_t a, int32_t b) {
 
 // Automatic Special Power Trigger based on Dynamic Real-Time Target & Optimal Route
 static void CheckAndTriggerAutoSpecial() {
-    if (!g_autoUseSpecial.load() && !g_autoPlay.load()) {
+    // Profiling Mode: strictly suppress special ability! Pure base run only!
+    if (g_profilingMode.load()) {
+        return;
+    }
+
+    if (!g_autoUseSpecial.load()) {
         return;
     }
     if (mainSpecialInstance == nullptr || (uintptr_t)mainSpecialInstance < 0x10000) {
@@ -1159,7 +1652,8 @@ static void CheckAndTriggerAutoSpecial() {
             if (currentEnergy >= m.requiredEnergy) {
                 // Exact hit target reached and required energy (2, 3, or 4 bars) achieved!
                 shouldTrigger = true;
-                triggerReason = "Optimal Route Step #" + std::to_string(idx + 1) + " (" + std::to_string(m.requiredEnergy) + "⚡ at #" + std::to_string(m.targetHit) + ")";
+                std::string stepPrefix = g_hasSavedProfile.load() ? "Profile Step #" : "Optimal Route Step #";
+                triggerReason = stepPrefix + std::to_string(idx + 1) + " (" + std::to_string(m.requiredEnergy) + "⚡ at #" + std::to_string(m.targetHit) + ")";
             } else if (currentEnergy >= 4) {
                 // Energy is 4/4 (full), must trigger to avoid wasting incoming energy
                 shouldTrigger = true;
@@ -1272,6 +1766,29 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
                 g_fretSustainStartTime[fret] = 0.0f;
             }
         }
+
+        // Song Profiling Run: Record real note execution data
+        if (g_profilingMode.load()) {
+            CachedSongNote rn;
+            rn.num = num;
+            rn.fret = fret;
+            float curSongTime = (mainInstance != nullptr) ? *(float *)((uintptr_t)mainInstance + 0x28) : b;
+            rn.time = curSongTime;
+            rn.duration = 0.0f;
+            void *rastro = *(void **)((uintptr_t)hm + 0x28);
+            if (rastro != nullptr && (uintptr_t)rastro > 0x10000) {
+                rn.duration = *(float *)((uintptr_t)rastro + 0x24);
+            }
+            void *sp = *(void **)((uintptr_t)hm + 0x30);
+            rn.special = 0;
+            if (sp != nullptr && (uintptr_t)sp > 0x10000) {
+                bool starNote = *(bool *)((uintptr_t)sp + 0x10);
+                if (starNote) rn.special = 1;
+            }
+            pthread_mutex_lock(&g_recordedNotesMutex);
+            g_recordedNotes.push_back(rn);
+            pthread_mutex_unlock(&g_recordedNotesMutex);
+        }
     }
 
     // Zero-latency Auto Special check right BEFORE scoring note, so milestone note ITSELF gets 2x bonus!
@@ -1364,6 +1881,14 @@ void (*old_Main_Notes_byv)(void *instance) = nullptr;
 void hook_Main_Notes_byv(void *instance) {
     if (instance != nullptr) {
         mainNotesInstance = instance;
+    }
+
+    // If song was running in profiling mode and completed, calculate & save profile before reset
+    if (g_profilingMode.load() && !g_profilingComplete.load()) {
+        int32_t hits = getNotesHit();
+        if (g_totalChartNotes > 50 && hits >= g_totalChartNotes - 20) {
+            FinishProfilingAndSaveProfile();
+        }
     }
 
     g_greenHits = 0;
@@ -1664,6 +2189,19 @@ void hook_Main_Update(void *instance) {
 
     // Auto Use Special periodic frame check
     CheckAndTriggerAutoSpecial();
+
+    // Check if Profiling Run is active and completed
+    if (g_profilingMode.load() && !g_profilingComplete.load()) {
+        int32_t hits = getNotesHit();
+        if (g_totalChartNotes > 50 && hits >= g_totalChartNotes) {
+            FinishProfilingAndSaveProfile();
+        } else if (mainInstance != nullptr && g_songDuration > 10.0f) {
+            float curSongTime = *(float *)((uintptr_t)mainInstance + 0x28);
+            if (curSongTime >= g_songDuration - 1.5f && hits >= g_totalChartNotes - 10) {
+                FinishProfilingAndSaveProfile();
+            }
+        }
+    }
 }
 
 // 10. Hook Main_Sounds::cfe (RVA: 0x20e267c)
@@ -2057,7 +2595,9 @@ jstring GetChartDetails(JNIEnv *env, jobject thiz) {
         "\"currentHits\":%d,"
         "\"targetScore\":%d,"
         "\"predictedScore\":%lld,"
-        "\"targetStatus\":\"%s\""
+        "\"targetStatus\":\"%s\","
+        "\"isProfiling\":%s,"
+        "\"hasSavedProfile\":%s"
         "}",
         g_chartHasData ? "true" : "false",
         EscapeJsonString(g_songTitle).c_str(),
@@ -2076,7 +2616,9 @@ jstring GetChartDetails(JNIEnv *env, jobject thiz) {
         currentHits,
         targetScore,
         (long long)predictedScore,
-        EscapeJsonString(targetStatus).c_str()
+        EscapeJsonString(targetStatus).c_str(),
+        g_profilingMode.load() ? "true" : "false",
+        g_hasSavedProfile.load() ? "true" : "false"
     );
 
     pthread_mutex_unlock(&g_chartAnalysisMutex);
@@ -2092,6 +2634,8 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("10_Toggle_Auto Play"),
             OBFUSCATE("11_Toggle_Auto Activate Special (Target & Optimal Route)"),
             OBFUSCATE("13_InputValue_Target Skor (0 = Auto Max)"),
+            OBFUSCATE("14_Toggle_🔬 Analyze Song (Profiling Run)"),
+            OBFUSCATE("15_Button_💾 Save / Apply Current Chart Profile"),
 
             OBFUSCATE("Category_⭐ Special & Multiplier"),
             OBFUSCATE("12_Toggle_Instant Full Special Energy"),
@@ -2107,7 +2651,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>⭐ Auto Special: Otomatis aktivasi SP dinamis kejar target skor.<br>🎯 Target Skor: Input manual skor target (cth: 75.000).<br>⚡ Instant Special: Energi langsung 100% saat note bintang kena.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.<br>📊 Chart HUD: Prediksi skor real-time, rute optimal, & trigger SP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>⭐ Auto Special: Otomatis aktivasi SP berbasis rute profil tersimpan.<br>🔬 Analyze Song: Pure base run untuk profil rute & estimasi skor optimal.<br>💾 Save Profile: Simpan profil lagu permanen ke storage.<br>🎯 Target Skor: Input manual target skor (cth: 75.000).<br>⚡ Instant Special: Energi langsung 100% saat note bintang kena.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.<br>📊 Chart HUD: Tampilan status profil, trigger kombo, & prediksi real-time.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -2166,6 +2710,37 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
                 Toast(env, obj, OBFUSCATE("🎯 Target Skor: Otomatis (Maksimal)"), ToastLength::LENGTH_SHORT);
             }
             break;
+
+        // Analyze Song (Profiling Run) (OFF by default)
+        case 14:
+            g_profilingMode = boolean;
+            LogDebug("Analyze Song (Profiling Run) toggled: %d", boolean);
+            if (boolean) {
+                g_profilingComplete = false;
+                g_autoPlay = true; // Auto Play must be active for pure base run
+                g_autoUseSpecial = false; // Suppress Special
+                pthread_mutex_lock(&g_recordedNotesMutex);
+                g_recordedNotes.clear();
+                pthread_mutex_unlock(&g_recordedNotesMutex);
+                Toast(env, obj, OBFUSCATE("🔬 Mode Analisis: AKTIF!\nAuto Play ON, Special OFF. Lagu dimainkan bersih dari awal untuk rekam profil."), ToastLength::LENGTH_LONG);
+            } else {
+                Toast(env, obj, OBFUSCATE("🔬 Mode Analisis: NONAKTIF"), ToastLength::LENGTH_SHORT);
+            }
+            break;
+
+        // Save / Apply Current Chart Profile (Button)
+        case 15: {
+            bool success = FinishProfilingAndSaveProfile();
+            if (success) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "💾 Profil chart tersimpan & aktif!\nRute: %s\nSkor Maks: %lld pts",
+                         g_pathSummary.c_str(), (long long)g_bestPotentialScore);
+                Toast(env, obj, msg, ToastLength::LENGTH_LONG);
+            } else {
+                Toast(env, obj, OBFUSCATE("⚠️ Belum ada data chart yang cukup untuk disimpan. Mainkan lagu terlebih dahulu!"), ToastLength::LENGTH_SHORT);
+            }
+            break;
+        }
 
         // Instant Full Special Energy Feature (OFF by default)
         case 12:

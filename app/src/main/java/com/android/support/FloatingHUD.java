@@ -475,11 +475,19 @@ public class FloatingHUD {
             int targetScore = obj.optInt("targetScore", 0);
             long predictedScore = obj.optLong("predictedScore", bestScore);
             String targetStatus = obj.optString("targetStatus", "AUTO MAX");
+            boolean isProfiling = obj.optBoolean("isProfiling", false);
+            boolean hasSavedProfile = obj.optBoolean("hasSavedProfile", false);
             pTargetScore = targetScore;
 
             if (hasData) {
                 if (tvChartTitle != null) {
-                    tvChartTitle.setText(Html.fromHtml("🎵 <b><font color='#FFFFFF'>" + title + "</font></b>"));
+                    if (isProfiling) {
+                        tvChartTitle.setText(Html.fromHtml("🔬 <b><font color='#FFD700'>[ANALISIS LAGU BERJALAN]</font></b><br>🎵 <font color='#FFFFFF'>" + title + "</font>"));
+                    } else if (hasSavedProfile) {
+                        tvChartTitle.setText(Html.fromHtml("⚡ <b><font color='#00E676'>[PROFIL AKTIF]</font></b> 🎵 <b><font color='#FFFFFF'>" + title + "</font></b>"));
+                    } else {
+                        tvChartTitle.setText(Html.fromHtml("🎵 <b><font color='#FFFFFF'>" + title + "</font></b>"));
+                    }
                 }
                 if (tvChartMeta != null) {
                     tvChartMeta.setText(Html.fromHtml("⏱️ <font color='#00E5FF'><b>" + durationStr + "</b></font> <font color='#90A4AE'>•</font> 🎯 <font color='#82CAFD'><b>" + totalNotes + " Notes</b></font>"));
@@ -503,7 +511,9 @@ public class FloatingHUD {
                     }
                 }
                 if (tvChartPathNext != null) {
-                    if (stepTotal > 0) {
+                    if (isProfiling) {
+                        tvChartPathNext.setText(Html.fromHtml("🔬 <b><font color='#00E5FF'>Merekam Note & Frase... (Special OFF)</font></b>"));
+                    } else if (stepTotal > 0) {
                         if (stepIndex < stepTotal) {
                             tvChartPathNext.setText(Html.fromHtml("🎯 Trigger Kombo: <b><font color='#76FF03'>#" + nextTargetHit + "</font></b> <small><font color='#00E5FF'>(" + nextReqEnergy + "⚡ Energi)</font> <font color='#FFD700'>[Step " + (stepIndex + 1) + "/" + stepTotal + "]</font></small>"));
                         } else {
@@ -514,7 +524,11 @@ public class FloatingHUD {
                     }
                 }
                 if (tvChartPathRoute != null) {
-                    tvChartPathRoute.setText(Html.fromHtml("📋 Rute: <font color='#80D8FF'><b>" + pathSummary + "</b></font>"));
+                    if (hasSavedProfile) {
+                        tvChartPathRoute.setText(Html.fromHtml("📋 Rute Profil: <font color='#00E676'><b>" + pathSummary + "</b></font> <small><font color='#76FF03'>[TERSIMPAN]</font></small>"));
+                    } else {
+                        tvChartPathRoute.setText(Html.fromHtml("📋 Rute: <font color='#80D8FF'><b>" + pathSummary + "</b></font>"));
+                    }
                 }
             } else {
                 if (tvChartTitle != null) {
