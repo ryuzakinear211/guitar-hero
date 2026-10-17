@@ -120,7 +120,6 @@ static std::atomic<bool> g_autoPlay{false};       // Master switch for Auto Play
 static std::atomic<int> g_fretVisualTimer[5]{0, 0, 0, 0, 0};
 static std::atomic<bool> g_fretSustaining[5]{false, false, false, false, false};
 static float g_fretSustainStartTime[5]{0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-static float g_fretSustainEndTime[5]{0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 static std::atomic<int32_t> g_autoHitsCount[5]{0, 0, 0, 0, 0};
 static std::atomic<int32_t> g_totalAutoHits{0};
 
@@ -135,9 +134,52 @@ static void *mainScorerInstance = nullptr;  // Pointer to Main_Scorer
 static void *mainFretsInstance = nullptr;   // Pointer to Main_Frets
 static void *g_chartInstance = nullptr;     // Pointer to ed (Chart Manager)
 
-// Cached note durations from chart (indexed by note num)
-static std::vector<float> g_noteDurations;
-static pthread_mutex_t g_noteDurationsMutex = PTHREAD_MUTEX_INITIALIZER;
+// Helper: Inspects active notes in Main_Notes::eoq directly from the engine
+// Returns true if a note on this fret is hit and actively sustaining
+static bool isFretActivelySustaining(int32_t fret) {
+    if (mainNotesInstance == nullptr || fret < 0 || fret >= 5) {
+        return false;
+    }
+
+    // List<hm> eoq at offset 0x20 in Main_Notes
+    void *eoq = *(void **)((uintptr_t)mainNotesInstance + 0x20);
+    if (eoq == nullptr || (uintptr_t)eoq < 0x10000) return false;
+
+    // Array of hm items at offset 0x10 in List<T>
+    void *items = *(void **)((uintptr_t)eoq + 0x10);
+    if (items == nullptr || (uintptr_t)items < 0x10000) return false;
+
+    int32_t size = *(int32_t *)((uintptr_t)eoq + 0x18);
+    int32_t capacity = *(int32_t *)((uintptr_t)items + 0x18);
+    if (size <= 0 || size > 300) return false;
+    if (size > capacity && capacity > 0) size = capacity;
+
+    for (int32_t i = 0; i < size; i++) {
+        void *hm = *(void **)((uintptr_t)items + 0x20 + i * sizeof(void *));
+        if (hm == nullptr || (uintptr_t)hm < 0x10000) continue;
+
+        int32_t noteFret = *(int32_t *)((uintptr_t)hm + 0x3c);
+        if (noteFret != fret) continue;
+
+        int32_t noteStatus = *(int32_t *)((uintptr_t)hm + 0x40);
+        // NoteStatus: 0 = normal (upcoming), 1 = hit, 2 = missed
+        if (noteStatus != 1) continue;
+
+        void *rastro = *(void **)((uintptr_t)hm + 0x28);
+        if (rastro == nullptr || (uintptr_t)rastro < 0x10000) continue;
+
+        bool hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
+        if (!hasRastro) continue;
+
+        int32_t rastroStatus = *(int32_t *)((uintptr_t)rastro + 0x24);
+        // RastroStatus: 0 = normal (just hit), 1 = hitting (sustaining)
+        // 2 = missed or finished naturally when tail passes strike line
+        if (rastroStatus == 0 || rastroStatus == 1) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // Color-specific note hit counters:
 // Fret 0 = Green, 1 = Red, 2 = Yellow, 3 = Blue, 4 = Orange
@@ -242,7 +284,6 @@ static void resetAllNoteCounters() {
         g_fretVisualTimer[i] = 0;
         g_fretSustaining[i] = false;
         g_fretSustainStartTime[i] = 0.0f;
-        g_fretSustainEndTime[i] = 0.0f;
         g_autoHitsCount[i] = 0;
         if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
             old_Main_Frets_byc(mainFretsInstance, i, false);
@@ -251,10 +292,6 @@ static void resetAllNoteCounters() {
     g_totalAutoHits = 0;
     g_currentCombo = 0;
     g_currentScore = 0;
-
-    pthread_mutex_lock(&g_noteDurationsMutex);
-    g_noteDurations.clear();
-    pthread_mutex_unlock(&g_noteDurationsMutex);
 
     if (mainNotesInstance != nullptr) {
         *(int32_t *)((uintptr_t)mainNotesInstance + 0x64) = 0; // acertadas
@@ -281,23 +318,11 @@ static Vector3 (*Transform_get_position)(void *transform) = nullptr;
 static int32_t (*ed_Count)(void *instance) = nullptr;
 static void *(*ed_bad)(void *instance, int32_t a) = nullptr;
 
-// Hook Main_Notes::Add (Real-time Note Recorder for durations)
+// Hook Main_Notes::Add (Captures mainNotesInstance)
 static void (*old_Main_Notes_Add)(void *instance, int32_t num, void *noteChart) = nullptr;
 static void hook_Main_Notes_Add(void *instance, int32_t num, void *noteChart) {
     if (instance != nullptr) {
         mainNotesInstance = instance;
-    }
-    if (noteChart != nullptr && num >= 0 && num < 20000) {
-        float nDur = *(float *)((uintptr_t)noteChart + 0x18);
-        pthread_mutex_lock(&g_noteDurationsMutex);
-        if (num == 0) {
-            g_noteDurations.clear();
-        }
-        if ((size_t)num >= g_noteDurations.size()) {
-            g_noteDurations.resize(num + 1, 0.0f);
-        }
-        g_noteDurations[num] = nDur;
-        pthread_mutex_unlock(&g_noteDurationsMutex);
     }
     if (old_Main_Notes_Add != nullptr) {
         old_Main_Notes_Add(instance, num, noteChart);
@@ -350,56 +375,24 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
         if (fret >= 0 && fret < 5) {
             void *rastro = *(void **)((uintptr_t)hm + 0x28);
             bool hasRastro = false;
-            if (rastro != nullptr) {
+            if (rastro != nullptr && (uintptr_t)rastro > 0x10000) {
                 // bool has: offset 0x20
                 hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
             }
 
             if (hasRastro) {
-                float duration = 0.0f;
-                // 1. Look up charted duration from g_noteDurations
-                pthread_mutex_lock(&g_noteDurationsMutex);
-                if (num >= 0 && (size_t)num < g_noteDurations.size()) {
-                    duration = g_noteDurations[num];
+                float songTime = 0.0f;
+                if (mainInstance != nullptr) {
+                    songTime = *(float *)((uintptr_t)mainInstance + 0x28);
                 }
-                pthread_mutex_unlock(&g_noteDurationsMutex);
-
-                // 2. Fallback: look up directly from chart array if needed
-                if (duration <= 0.01f && g_chartInstance != nullptr) {
-                    void *dya = *(void **)((uintptr_t)g_chartInstance + 0x20);
-                    if (dya != nullptr) {
-                        int32_t count = *(int32_t *)((uintptr_t)dya + 0x18);
-                        if (num >= 0 && num < count) {
-                            void *nc = *(void **)((uintptr_t)dya + 0x20 + num * sizeof(void *));
-                            if (nc != nullptr) {
-                                duration = *(float *)((uintptr_t)nc + 0x18);
-                            }
-                        }
-                    }
-                }
-
-                // 3. Fallback: call ed_bad if needed
-                if (duration <= 0.01f && ed_bad != nullptr && g_chartInstance != nullptr) {
-                    void *nc = ed_bad(g_chartInstance, num);
-                    if (nc != nullptr) {
-                        duration = *(float *)((uintptr_t)nc + 0x18);
-                    }
-                }
-
-                // 4. Safe fallback duration for sustain note
-                if (duration <= 0.01f) {
-                    duration = 0.35f;
-                }
-
                 g_fretSustaining[fret] = true;
-                g_fretSustainStartTime[fret] = b;
-                g_fretSustainEndTime[fret] = b + duration;
-                LogDebug("Sustain START: fret=%d, num=%d, duration=%.2fs, endTime=%.2fs", fret, num, duration, b + duration);
+                g_fretSustainStartTime[fret] = songTime;
+                g_fretVisualTimer[fret] = 0; // Hold active sustain
+                LogDebug("Sustain START: fret=%d, num=%d, songTime=%.2fs", fret, num, songTime);
             } else {
                 // Normal tap note (no sustain trail)
                 g_fretSustaining[fret] = false;
                 g_fretSustainStartTime[fret] = 0.0f;
-                g_fretSustainEndTime[fret] = 0.0f;
             }
         }
     }
@@ -437,7 +430,11 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
                     TriggerFretFireEffect(fret);
                     if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                         old_Main_Frets_byc(mainFretsInstance, fret, true);
-                        g_fretVisualTimer[fret] = 5;
+                        if (g_fretSustaining[fret].load()) {
+                            g_fretVisualTimer[fret] = 0;
+                        } else {
+                            g_fretVisualTimer[fret] = 5;
+                        }
                     }
                     g_autoHitsCount[fret]++;
                     g_totalAutoHits++;
@@ -463,12 +460,13 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
             default: break;
         }
         if (fret >= 0 && fret < 5) {
-            g_fretSustaining[fret] = false;
-            g_fretSustainStartTime[fret] = 0.0f;
-            g_fretSustainEndTime[fret] = 0.0f;
-            g_fretVisualTimer[fret] = 0;
-            if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
-                old_Main_Frets_byc(mainFretsInstance, fret, false);
+            if (!isFretActivelySustaining(fret)) {
+                g_fretSustaining[fret] = false;
+                g_fretSustainStartTime[fret] = 0.0f;
+                g_fretVisualTimer[fret] = 0;
+                if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                    old_Main_Frets_byc(mainFretsInstance, fret, false);
+                }
             }
         }
     }
@@ -488,10 +486,6 @@ void hook_Main_Notes_byv(void *instance) {
         mainNotesInstance = instance;
     }
 
-    pthread_mutex_lock(&g_noteDurationsMutex);
-    g_noteDurations.clear();
-    pthread_mutex_unlock(&g_noteDurationsMutex);
-
     g_greenHits = 0;
     g_redHits = 0;
     g_yellowHits = 0;
@@ -509,7 +503,6 @@ void hook_Main_Notes_byv(void *instance) {
         g_fretVisualTimer[i] = 0;
         g_fretSustaining[i] = false;
         g_fretSustainStartTime[i] = 0.0f;
-        g_fretSustainEndTime[i] = 0.0f;
         g_autoHitsCount[i] = 0;
         if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
             old_Main_Frets_byc(mainFretsInstance, i, false);
@@ -525,18 +518,19 @@ void hook_Main_Notes_byv(void *instance) {
 }
 
 // 5. Hook Main_Notes::bzc (RVA: 0x20b9874)
-// Called when a note's sustain/rastro trail ends (from commit e4947d)
+// Called when a note's sustain/rastro trail ends or misses
 void (*old_Main_Notes_bzc)(void *instance, void *hm) = nullptr;
 void hook_Main_Notes_bzc(void *instance, void *hm) {
     if (hm != nullptr) {
         int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
         if (fret >= 0 && fret < 5) {
-            g_fretSustaining[fret] = false;
-            g_fretSustainStartTime[fret] = 0.0f;
-            g_fretSustainEndTime[fret] = 0.0f;
-            g_fretVisualTimer[fret] = 0;
-            if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
-                old_Main_Frets_byc(mainFretsInstance, fret, false); // Release visual fret
+            if (!isFretActivelySustaining(fret)) {
+                g_fretSustaining[fret] = false;
+                g_fretSustainStartTime[fret] = 0.0f;
+                g_fretVisualTimer[fret] = 0;
+                if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                    old_Main_Frets_byc(mainFretsInstance, fret, false); // Release visual fret
+                }
             }
         }
     }
@@ -554,7 +548,7 @@ void hook_Main_Frets_byc(void *instance, int32_t fret, bool pressed) {
 
     if (g_autoPlay.load() && fret >= 0 && fret < 5) {
         // Prevent idle touch polling (byb) from canceling the visual touch during active hit or sustain
-        if (!pressed && (g_fretVisualTimer[fret] > 0 || g_fretSustaining[fret].load())) {
+        if (!pressed && (g_fretVisualTimer[fret] > 0 || g_fretSustaining[fret].load() || isFretActivelySustaining(fret))) {
             return;
         }
     }
@@ -614,7 +608,11 @@ void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
                 // Animate visual fret touch press synchronized with hit fire burst
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                     old_Main_Frets_byc(mainFretsInstance, fret, true);
-                    g_fretVisualTimer[fret] = 5; // Crisp visual tap animation (~83ms, synchronized with hit)
+                    if (g_fretSustaining[fret].load()) {
+                        g_fretVisualTimer[fret] = 0; // Sustain hold is active
+                    } else {
+                        g_fretVisualTimer[fret] = 5; // Crisp visual tap animation (~83ms, synchronized with hit)
+                    }
                 }
 
                 g_autoHitsCount[fret]++;
@@ -644,7 +642,7 @@ bool hook_Main_Frets_bye(void *instance, int32_t fret) {
 
     // B. Auto Sustain hold
     if (g_autoPlay.load() && fret >= 0 && fret < 5) {
-        if (g_fretSustaining[fret].load()) {
+        if (isFretActivelySustaining(fret) || g_fretSustaining[fret].load()) {
             return true;
         }
     }
@@ -702,29 +700,36 @@ void hook_Main_Update(void *instance) {
         songTime = *(float *)((uintptr_t)mainInstance + 0x28);
     }
 
-    // Manage visual fret release timers for tap notes & precise duration release for sustain
+    // Manage visual fret hold and release timers
     for (int i = 0; i < 5; i++) {
-        // A. Release sustain hold when note tail finishes
-        if (g_fretSustaining[i].load()) {
-            if (songTime >= g_fretSustainEndTime[i] || 
-                (songTime - g_fretSustainStartTime[i]) > 4.5f || 
-                (songTime < g_fretSustainStartTime[i] - 0.5f)) {
+        bool activelySustaining = isFretActivelySustaining(i);
 
+        // A. Manage sustain note hold and natural finish
+        if (g_fretSustaining[i].load()) {
+            bool timeExceeded = (songTime > 0.0f && g_fretSustainStartTime[i] > 0.0f && 
+                                (songTime - g_fretSustainStartTime[i] > 6.0f || songTime < g_fretSustainStartTime[i] - 1.0f));
+
+            if (!activelySustaining || timeExceeded) {
                 g_fretSustaining[i] = false;
                 g_fretSustainStartTime[i] = 0.0f;
-                g_fretSustainEndTime[i] = 0.0f;
                 g_fretVisualTimer[i] = 0;
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                     old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret cleanly!
                 }
-                LogDebug("Sustain END: fret=%d released cleanly at songTime=%.2fs", i, songTime);
+                LogDebug("Sustain END: fret=%d released cleanly (active=%d, timeExceeded=%d)", 
+                         i, activelySustaining ? 1 : 0, timeExceeded ? 1 : 0);
+            }
+        } else if (activelySustaining) {
+            g_fretSustaining[i] = true;
+            if (g_fretSustainStartTime[i] <= 0.0f) {
+                g_fretSustainStartTime[i] = songTime;
             }
         }
 
         // B. Release tap timer for standard notes
         if (g_fretVisualTimer[i] > 0) {
             int t = --g_fretVisualTimer[i];
-            if (t == 0 && !g_fretSustaining[i].load()) {
+            if (t == 0 && !g_fretSustaining[i].load() && !activelySustaining) {
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                     old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret cleanly!
                 }
@@ -1018,7 +1023,6 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
                     g_fretVisualTimer[i] = 0;
                     g_fretSustaining[i] = false;
                     g_fretSustainStartTime[i] = 0.0f;
-                    g_fretSustainEndTime[i] = 0.0f;
                     if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                         old_Main_Frets_byc(mainFretsInstance, i, false);
                     }
