@@ -311,24 +311,7 @@ static int64_t g_baseFcScore = 0;
 static std::string g_pathSummary = "-";
 static std::vector<SpPathMilestone> g_activePathMilestones;
 
-// Community-verified competitive chart path for DragonForce - Through the Fire and Flames (Hard mode)
-// Path:  2    2    2    2    2    2    2     3     3     2     2     2     4
-// Kombo: 128  294  456  589  825  969  1095  1366  1823  2018  2152  2259  2607
-static const std::vector<SpPathMilestone> DRAGONFORCE_HARD_PATH = {
-    {128, 2, 22.5f, 7.5f},
-    {294, 2, 51.0f, 7.5f},
-    {456, 2, 80.0f, 7.5f},
-    {589, 2, 104.0f, 7.5f},
-    {825, 2, 145.0f, 7.5f},
-    {969, 2, 170.0f, 7.5f},
-    {1095, 2, 192.0f, 7.5f},
-    {1366, 3, 240.0f, 11.25f},
-    {1823, 3, 320.0f, 11.25f},
-    {2018, 2, 355.0f, 7.5f},
-    {2152, 2, 378.0f, 7.5f},
-    {2259, 2, 396.0f, 7.5f},
-    {2607, 4, 458.0f, 15.0f}
-};
+
 
 static void resetAllNoteCounters() {
     g_greenHits = 0;
@@ -385,11 +368,7 @@ struct Vector3 {
 static void *(*Component_get_transform)(void *component) = nullptr;
 static Vector3 (*Transform_get_position)(void *transform) = nullptr;
 
-// Function pointers for Chart & Note inspection in ed (Chart Manager)
-static int32_t (*ed_Count)(void *instance) = nullptr;
-static void *(*ed_bad)(void *instance, int32_t a) = nullptr;
-static float (*ed_Length)(void *instance) = nullptr;
-static void *(*ed_Title)(void *instance) = nullptr;
+
 
 static std::string Il2CppStringToStdString(void *il2cppString) {
     if (il2cppString == nullptr || (uintptr_t)il2cppString < 0x10000) {
@@ -446,21 +425,25 @@ static std::string EscapeJsonString(const std::string &input) {
 static void AnalyzeChartAndCalculateMetrics() {
     std::vector<CachedSongNote> notes;
 
-    // 1. Try to read directly from g_chartInstance (ed)
-    if (g_chartInstance != nullptr && ed_Count != nullptr && ed_bad != nullptr) {
-        int32_t count = ed_Count(g_chartInstance);
-        if (count > 0 && count < 15000) {
-            notes.reserve(count);
-            for (int32_t i = 0; i < count; i++) {
-                void *nc = ed_bad(g_chartInstance, i);
-                if (nc == nullptr || (uintptr_t)nc < 0x10000) continue;
-                CachedSongNote note;
-                note.num = i;
-                note.fret = *(int32_t *)((uintptr_t)nc + 0x10);
-                note.time = *(float *)((uintptr_t)nc + 0x14);
-                note.duration = *(float *)((uintptr_t)nc + 0x18);
-                note.special = *(int32_t *)((uintptr_t)nc + 0x1c);
-                notes.push_back(note);
+    // 1. Try to read directly from g_chartInstance (ed) safely
+    if (g_chartInstance != nullptr && (uintptr_t)g_chartInstance > 0x10000) {
+        void *dya = *(void **)((uintptr_t)g_chartInstance + 0x20);
+        if (dya != nullptr && (uintptr_t)dya > 0x10000) {
+            int32_t count = *(int32_t *)((uintptr_t)dya + 0x18);
+            if (count > 0 && count < 30000) {
+                void **items = (void **)((uintptr_t)dya + 0x20);
+                notes.reserve(count);
+                for (int32_t i = 0; i < count; i++) {
+                    void *nc = items[i];
+                    if (nc == nullptr || (uintptr_t)nc < 0x10000) continue;
+                    CachedSongNote note;
+                    note.num = i;
+                    note.fret = *(int32_t *)((uintptr_t)nc + 0x10);
+                    note.time = *(float *)((uintptr_t)nc + 0x14);
+                    note.duration = *(float *)((uintptr_t)nc + 0x18);
+                    note.special = *(int32_t *)((uintptr_t)nc + 0x1c);
+                    notes.push_back(note);
+                }
             }
         }
     }
@@ -476,24 +459,19 @@ static void AnalyzeChartAndCalculateMetrics() {
         return; // Chart not ready yet
     }
 
-    // 3. Extract Song Title
+    // 3. Extract Song Title safely
     std::string title = "";
-    if (g_chartInstance != nullptr && ed_Title != nullptr) {
-        void *titleObj = ed_Title(g_chartInstance);
-        if (titleObj != nullptr) {
-            title = Il2CppStringToStdString(titleObj);
-        }
-    }
-    if (title.empty() && g_chartInstance != nullptr) {
-        void *dyb = *(void **)((uintptr_t)g_chartInstance + 0x28);
-        if (dyb != nullptr) {
-            title = Il2CppStringToStdString(dyb);
-        }
-    }
-    if (title.empty() && g_chartInstance != nullptr) {
-        void *dyc = *(void **)((uintptr_t)g_chartInstance + 0x30);
-        if (dyc != nullptr) {
-            title = Il2CppStringToStdString(dyc);
+    if (g_chartInstance != nullptr && (uintptr_t)g_chartInstance > 0x10000) {
+        void *dyb = *(void **)((uintptr_t)g_chartInstance + 0x28); // artist
+        void *dyc = *(void **)((uintptr_t)g_chartInstance + 0x30); // title
+        std::string artist = Il2CppStringToStdString(dyb);
+        std::string song = Il2CppStringToStdString(dyc);
+        if (!artist.empty() && !song.empty()) {
+            title = artist + " - " + song;
+        } else if (!song.empty()) {
+            title = song;
+        } else if (!artist.empty()) {
+            title = artist;
         }
     }
     if (title.empty()) {
@@ -507,11 +485,8 @@ static void AnalyzeChartAndCalculateMetrics() {
 
     // 4. Extract Song Duration
     float duration = 0.0f;
-    if (g_chartInstance != nullptr && ed_Length != nullptr) {
-        duration = ed_Length(g_chartInstance);
-    }
-    if (duration <= 0.0f && g_chartInstance != nullptr) {
-        duration = *(float *)((uintptr_t)g_chartInstance + 0x38); // dyd
+    if (g_chartInstance != nullptr && (uintptr_t)g_chartInstance > 0x10000) {
+        duration = *(float *)((uintptr_t)g_chartInstance + 0x38); // dyd (Length)
     }
     if (duration <= 0.0f && !notes.empty()) {
         duration = notes.back().time + notes.back().duration;
@@ -555,18 +530,8 @@ static void AnalyzeChartAndCalculateMetrics() {
     int32_t totalPhrases = (int32_t)phrases.size();
 
     // 6. Build Deterministic Optimal Path
-    bool isDragonforce = false;
-    if (title.find("Dragonforce") != std::string::npos ||
-        title.find("DragonForce") != std::string::npos ||
-        title.find("Fire and Flames") != std::string::npos ||
-        notes.size() >= 2500) {
-        isDragonforce = true;
-    }
-
     std::vector<SpPathMilestone> milestones;
-    if (isDragonforce) {
-        milestones = DRAGONFORCE_HARD_PATH;
-    } else if (!phrases.empty()) {
+    if (!phrases.empty()) {
         int32_t simEnergy = 0;
         float simActivationEndTime = -1.0f;
 
@@ -590,7 +555,7 @@ static void AnalyzeChartAndCalculateMetrics() {
                 if (simEnergy >= 4) {
                     shouldSchedule = true; // Bar full (4/4), schedule activation to prevent waste
                 } else if (!hasNextPhrase) {
-                    shouldSchedule = true; // Outro, no more phrases
+                    shouldSchedule = true; // Outro, no more phrases ahead
                 } else if (proposedEndTime <= nextPhraseStart) {
                     shouldSchedule = true; // Clean window without overlapping next phrase
                 }
@@ -608,12 +573,11 @@ static void AnalyzeChartAndCalculateMetrics() {
         // Outro check: if energy remained at end of song
         if (simEnergy >= 2 && !notes.empty()) {
             int32_t outroHit = notes.back().num - 25;
-            if (outroHit > 30) {
-                float dur = (float)simEnergy * 3.75f;
-                float startT = notes.back().time - dur;
-                if (startT < 0.0f) startT = 0.0f;
-                milestones.push_back({outroHit, simEnergy, startT, dur});
-            }
+            if (outroHit < 30) outroHit = 30;
+            float dur = (float)simEnergy * 3.75f;
+            float startT = notes.back().time - dur;
+            if (startT < 0.0f) startT = 0.0f;
+            milestones.push_back({outroHit, simEnergy, startT, dur});
         }
     } else {
         // Fallback for custom charts without star notes
@@ -630,21 +594,40 @@ static void AnalyzeChartAndCalculateMetrics() {
     }
     if (pathSummary.empty()) pathSummary = "-";
 
-    // 8. Calculate Best Potential Score & Base FC Score
+    // 8. Calculate Best Potential Score & Base FC Score using exact Guitar Flash scoring rules
     int64_t bestScore = 0;
     int64_t baseScore = 0;
     int32_t simCombo = 0;
 
     for (size_t i = 0; i < notes.size(); i++) {
-        int32_t mult = 1;
-        if (simCombo >= 30) mult = 4;
-        else if (simCombo >= 20) mult = 3;
-        else if (simCombo >= 10) mult = 2;
+        // Base note points:
+        // Combo 0..9: 5 pts (1x)
+        // Combo 10..19: 10 pts (2x)
+        // Combo 20..29: 15 pts (3x)
+        // Combo >= 30: 20 pts (4x)
+        int64_t noteBase = 5;
+        float mult = 1.0f;
+        if (simCombo >= 30) {
+            noteBase = 20;
+            mult = 4.0f;
+        } else if (simCombo >= 20) {
+            noteBase = 15;
+            mult = 3.0f;
+        } else if (simCombo >= 10) {
+            noteBase = 10;
+            mult = 2.0f;
+        }
 
-        int64_t noteBase = 50 * mult;
-        int64_t sustainBase = (int64_t)(notes[i].duration * 250.0f * (float)mult);
+        // Sustain points:
+        // ~2.5 pts per second per multiplier in Guitar Flash
+        // At 4x multiplier: 10 pts/sec
+        int64_t sustainBase = 0;
+        if (notes[i].duration > 0.1f) {
+            sustainBase = (int64_t)(notes[i].duration * 2.5f * mult);
+        }
         baseScore += noteBase + sustainBase;
 
+        // Check if note falls within an active SP window
         bool isSpActive = false;
         for (const auto &m : milestones) {
             if (notes[i].time >= m.startTime && notes[i].time <= (m.startTime + m.duration)) {
@@ -653,9 +636,10 @@ static void AnalyzeChartAndCalculateMetrics() {
             }
         }
 
-        int32_t spMult = isSpActive ? (mult * 2) : mult;
-        int64_t noteSp = 50 * spMult;
-        int64_t sustainSp = (int64_t)(notes[i].duration * 250.0f * (float)spMult);
+        // With Special Power active:
+        // Multiplier doubles: 10, 20, 30, 40 pts
+        int64_t noteSp = isSpActive ? (noteBase * 2) : noteBase;
+        int64_t sustainSp = isSpActive ? (int64_t)(notes[i].duration * 2.5f * mult * 2.0f) : sustainBase;
         bestScore += noteSp + sustainSp;
 
         simCombo++;
@@ -687,10 +671,10 @@ static void AnalyzeChartAndCalculateMetrics() {
 // Hook ed::bab (Chart loader & Song detector)
 static void (*old_ed_bab)(void *instance, int32_t a, void *b, int32_t c, void *d, void *e) = nullptr;
 static void hook_ed_bab(void *instance, int32_t a, void *b, int32_t c, void *d, void *e) {
-    if (instance != nullptr) {
+    if (instance != nullptr && (uintptr_t)instance > 0x10000) {
         g_chartInstance = instance;
     }
-    if (b != nullptr) {
+    if (b != nullptr && (uintptr_t)b > 0x10000) {
         std::string name = Il2CppStringToStdString(b);
         if (!name.empty()) {
             pthread_mutex_lock(&g_chartAnalysisMutex);
@@ -703,8 +687,6 @@ static void hook_ed_bab(void *instance, int32_t a, void *b, int32_t c, void *d, 
     if (old_ed_bab != nullptr) {
         old_ed_bab(instance, a, b, c, d, e);
     }
-
-    AnalyzeChartAndCalculateMetrics();
 }
 
 // Hook Main_Notes::Add (Captures mainNotesInstance and caches chart notes)
@@ -1094,10 +1076,14 @@ void hook_Main_Update(void *instance) {
 
         // Main.chart: 0x58
         void *chart = *(void **)((uintptr_t)instance + 0x58);
-        if (chart != nullptr) {
+        if (chart != nullptr && (uintptr_t)chart > 0x10000) {
             g_chartInstance = chart;
-            if (!g_chartAnalyzed.load() || g_chartNeedReanalysis.load()) {
-                AnalyzeChartAndCalculateMetrics();
+            void *dya = *(void **)((uintptr_t)chart + 0x20);
+            if (dya != nullptr && (uintptr_t)dya > 0x10000) {
+                int32_t count = *(int32_t *)((uintptr_t)dya + 0x18);
+                if (count > 0 && (!g_chartAnalyzed.load() || g_chartNeedReanalysis.load())) {
+                    AnalyzeChartAndCalculateMetrics();
+                }
             }
         }
 
@@ -1415,17 +1401,9 @@ void *hack_thread(void *) {
              lx_op_Implicit_from_int != nullptr ? "OK" : "FAIL",
              lx_op_Implicit_to_int != nullptr ? "OK" : "FAIL");
 
-    // Resolve ed methods for chart lookahead inspection
-    ed_Count = reinterpret_cast<int32_t (*)(void *)>(base + 0x1c31f44);
-    ed_bad = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1c31f14);
-    ed_Length = reinterpret_cast<float (*)(void *)>(base + 0x1c31f5c);
-    ed_Title = reinterpret_cast<void *(*)(void *)>(base + 0x1c31f64);
+    // Hook ed::bab for song detection
     HOOK("0x1c31de0", hook_ed_bab, old_ed_bab);
-    LogDebug("Resolve ed methods: Count=%s, bad=%s, Length=%s, Title=%s, Hook bab=%s",
-             ed_Count != nullptr ? "OK" : "FAIL",
-             ed_bad != nullptr ? "OK" : "FAIL",
-             ed_Length != nullptr ? "OK" : "FAIL",
-             ed_Title != nullptr ? "OK" : "FAIL",
+    LogDebug("Resolve ed methods: Hook bab=%s",
              old_ed_bab != nullptr ? "SUCCESS" : "FAILED");
 
     LogDebug("All Guitar Hero Real-Time, Auto Play, Song Unlock & Chart Analysis hooks installed successfully!");
