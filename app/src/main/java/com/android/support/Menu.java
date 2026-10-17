@@ -122,6 +122,8 @@ public class Menu {
 
     public static native int[] GetNoteStats();
 
+    public static native String GetChartDetails();
+
     //Here we write the code for our Menu
     // Reference: https://www.androidhive.info/2016/11/android-floating-widget-like-facebook-chat-head/
     public Menu(Context context) {

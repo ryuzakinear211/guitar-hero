@@ -21,6 +21,9 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import android.text.TextUtils;
+import org.json.JSONObject;
+
 import java.io.File;
 import java.io.FileWriter;
 import java.io.PrintWriter;
@@ -49,6 +52,18 @@ public class FloatingHUD {
     private TextView tvAcc;
     private TextView tvCombo;
 
+    // Chart Detail Views
+    private LinearLayout mChartSection;
+    private TextView tvChartTitle;
+    private TextView tvChartMeta;
+    private TextView tvChartSp;
+    private TextView tvChartScore;
+    private TextView tvChartPathNext;
+    private TextView tvChartPathRoute;
+    private TextView tvToggleChart;
+    private boolean isChartExpanded = true;
+    private int chartUpdateTick = 0;
+
     private Handler mHandler;
     private Runnable mUpdateRunnable;
     private boolean isVisible = false;
@@ -58,6 +73,8 @@ public class FloatingHUD {
     private int pGreen = -1, pRed = -1, pYellow = -1, pBlue = -1, pOrange = -1;
     private int pMiss = -1, pTotal = -1;
     private int pCombo = -1;
+    private int pScore = -1;
+    private String pChartJson = "";
 
     public FloatingHUD(Context context) {
         this.mContext = context;
@@ -100,17 +117,17 @@ public class FloatingHUD {
         mCard = new LinearLayout(mContext);
         mCard.setOrientation(LinearLayout.VERTICAL);
         mCard.setPadding(dp(10), dp(8), dp(10), dp(8));
-        mCard.setMinimumWidth(dp(195));
+        mCard.setMinimumWidth(dp(220));
 
         // Dark sleek glassmorphism background with cyan accent border
         GradientDrawable bg = new GradientDrawable();
         bg.setShape(GradientDrawable.RECTANGLE);
-        bg.setColor(Color.parseColor("#E0111A24")); // 88% dark slate
+        bg.setColor(Color.parseColor("#E60F1722")); // 90% dark slate
         bg.setCornerRadius(dp(10));
-        bg.setStroke(dp(1.2f), Color.parseColor("#4D82CAFD")); // Subtle cyan stroke
+        bg.setStroke(dp(1.2f), Color.parseColor("#4D00E5FF")); // Subtle cyan stroke
         mCard.setBackground(bg);
 
-        // Header (Title + Close Button)
+        // Header (Title + Toggle Chart + Close Button)
         LinearLayout header = new LinearLayout(mContext);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
@@ -118,10 +135,27 @@ public class FloatingHUD {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         tvTitle = new TextView(mContext);
-        tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font></b>"));
+        tvTitle.setText(Html.fromHtml("<b><font color='#00E5FF'>⚡ NOTE & CHART HUD</font></b>"));
         tvTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         tvTitle.setTypeface(Typeface.DEFAULT_BOLD);
         tvTitle.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+
+        tvToggleChart = new TextView(mContext);
+        tvToggleChart.setText(" ▴ ");
+        tvToggleChart.setTextColor(Color.parseColor("#80D8FF"));
+        tvToggleChart.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        tvToggleChart.setTypeface(Typeface.DEFAULT_BOLD);
+        tvToggleChart.setPadding(dp(6), dp(2), dp(6), dp(2));
+        tvToggleChart.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                isChartExpanded = !isChartExpanded;
+                if (mChartSection != null) {
+                    mChartSection.setVisibility(isChartExpanded ? View.VISIBLE : View.GONE);
+                }
+                tvToggleChart.setText(isChartExpanded ? " ▴ " : " ▾ ");
+            }
+        });
 
         TextView tvClose = new TextView(mContext);
         tvClose.setText(" ✕ ");
@@ -137,15 +171,82 @@ public class FloatingHUD {
         });
 
         header.addView(tvTitle);
+        header.addView(tvToggleChart);
         header.addView(tvClose);
         mCard.addView(header);
+
+        // =====================================================================
+        // Chart Details Section (Collapsible, Sleek Inset Container)
+        // =====================================================================
+        mChartSection = new LinearLayout(mContext);
+        mChartSection.setOrientation(LinearLayout.VERTICAL);
+        mChartSection.setPadding(dp(7), dp(6), dp(7), dp(6));
+        LinearLayout.LayoutParams chartSecParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        chartSecParams.setMargins(0, dp(4), 0, dp(4));
+        mChartSection.setLayoutParams(chartSecParams);
+
+        GradientDrawable chartBg = new GradientDrawable();
+        chartBg.setShape(GradientDrawable.RECTANGLE);
+        chartBg.setColor(Color.parseColor("#590B131D")); // Sleek dark card inset
+        chartBg.setCornerRadius(dp(6));
+        chartBg.setStroke(dp(1), Color.parseColor("#3300E5FF")); // Subtle neon cyan accent
+        mChartSection.setBackground(chartBg);
+
+        // 1. Judul Lagu (Song Title)
+        tvChartTitle = new TextView(mContext);
+        tvChartTitle.setText(Html.fromHtml("🎵 <i><font color='#90A4AE'>Menunggu Lagu Dimulai...</font></i>"));
+        tvChartTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
+        tvChartTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        tvChartTitle.setSingleLine(true);
+        tvChartTitle.setEllipsize(TextUtils.TruncateAt.END);
+        mChartSection.addView(tvChartTitle);
+
+        // 2. Durasi Lagu & Total Notes
+        tvChartMeta = new TextView(mContext);
+        tvChartMeta.setText(Html.fromHtml("⏱️ <font color='#90A4AE'>--:-- • 0 Notes</font>"));
+        tvChartMeta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f);
+        tvChartMeta.setPadding(0, dp(2), 0, 0);
+        mChartSection.addView(tvChartMeta);
+
+        // 3. Total Note Special (Energi) & Frase
+        tvChartSp = new TextView(mContext);
+        tvChartSp.setText(Html.fromHtml("⭐ Note SP: <font color='#90A4AE'>0 (0 Frase)</font>"));
+        tvChartSp.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f);
+        tvChartSp.setPadding(0, dp(2), 0, 0);
+        mChartSection.addView(tvChartSp);
+
+        // 4. Skor Maksimal (Best Potential Score)
+        tvChartScore = new TextView(mContext);
+        tvChartScore.setText(Html.fromHtml("🏆 Skor Maks: <font color='#90A4AE'>-- pts</font>"));
+        tvChartScore.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f);
+        tvChartScore.setTypeface(Typeface.DEFAULT_BOLD);
+        tvChartScore.setPadding(0, dp(2), 0, 0);
+        mChartSection.addView(tvChartScore);
+
+        // 5. Next SP Milestone Target
+        tvChartPathNext = new TextView(mContext);
+        tvChartPathNext.setText(Html.fromHtml("🗺️ Next SP: <font color='#90A4AE'>--</font>"));
+        tvChartPathNext.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f);
+        tvChartPathNext.setTypeface(Typeface.DEFAULT_BOLD);
+        tvChartPathNext.setPadding(0, dp(2), 0, 0);
+        mChartSection.addView(tvChartPathNext);
+
+        // 6. Optimal Route Summary
+        tvChartPathRoute = new TextView(mContext);
+        tvChartPathRoute.setText(Html.fromHtml("📋 Rute: <font color='#90A4AE'>--</font>"));
+        tvChartPathRoute.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f);
+        tvChartPathRoute.setPadding(0, dp(1), 0, 0);
+        mChartSection.addView(tvChartPathRoute);
+
+        mCard.addView(mChartSection);
 
         // Thin Separator line
         View divider1 = new View(mContext);
         divider1.setBackgroundColor(Color.parseColor("#26FFFFFF"));
         LinearLayout.LayoutParams divParams1 = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
-        divParams1.setMargins(0, dp(5), 0, dp(6));
+        divParams1.setMargins(0, dp(4), 0, dp(5));
         divider1.setLayoutParams(divParams1);
         mCard.addView(divider1);
 
@@ -234,7 +335,7 @@ public class FloatingHUD {
         divider3.setLayoutParams(divParams3);
         mCard.addView(divider3);
 
-        // Row 4: Live Combo
+        // Row 4: Live Combo & Live Score
         LinearLayout row4 = new LinearLayout(mContext);
         row4.setOrientation(LinearLayout.HORIZONTAL);
         row4.setGravity(Gravity.CENTER_VERTICAL);
@@ -332,6 +433,12 @@ public class FloatingHUD {
 
                             updateCounts(green, red, yellow, blue, orange, total, miss, autoHits, autoMaster, combo, score);
                         }
+
+                        // Periodic chart detail updates (every 3 ticks = ~300ms)
+                        if (++chartUpdateTick >= 3) {
+                            chartUpdateTick = 0;
+                            updateChartDetails();
+                        }
                     } catch (Throwable t) {
                         log("Error updating stats: " + t.getMessage());
                     }
@@ -342,13 +449,92 @@ public class FloatingHUD {
         mHandler.post(mUpdateRunnable);
     }
 
+    public void updateChartDetails() {
+        try {
+            String jsonStr = Menu.GetChartDetails();
+            if (jsonStr == null || jsonStr.equals(pChartJson)) {
+                return;
+            }
+            pChartJson = jsonStr;
+
+            JSONObject obj = new JSONObject(jsonStr);
+            boolean hasData = obj.optBoolean("hasData", false);
+            String title = obj.optString("title", "Menunggu Lagu...");
+            String durationStr = obj.optString("durationStr", "--:--");
+            int totalNotes = obj.optInt("totalNotes", 0);
+            int spNotes = obj.optInt("spNotes", 0);
+            int spPhrases = obj.optInt("spPhrases", 0);
+            long bestScore = obj.optLong("bestScore", 0);
+            long baseScore = obj.optLong("baseScore", 0);
+            String pathSummary = obj.optString("pathSummary", "-");
+            int stepIndex = obj.optInt("stepIndex", 0);
+            int stepTotal = obj.optInt("stepTotal", 0);
+            int nextTargetHit = obj.optInt("nextTargetHit", 0);
+            int nextReqEnergy = obj.optInt("nextReqEnergy", 0);
+
+            if (hasData) {
+                if (tvChartTitle != null) {
+                    tvChartTitle.setText(Html.fromHtml("🎵 <b><font color='#FFFFFF'>" + title + "</font></b>"));
+                }
+                if (tvChartMeta != null) {
+                    tvChartMeta.setText(Html.fromHtml("⏱️ <font color='#00E5FF'><b>" + durationStr + "</b></font> <font color='#90A4AE'>•</font> 🎯 <font color='#82CAFD'><b>" + totalNotes + " Notes</b></font>"));
+                }
+                if (tvChartSp != null) {
+                    tvChartSp.setText(Html.fromHtml("⭐ Note SP: <b><font color='#E040FB'>" + spNotes + "</font></b> <small><font color='#B388FF'>(" + spPhrases + " Frase / Energi)</font></small>"));
+                }
+                if (tvChartScore != null) {
+                    if (baseScore > 0) {
+                        tvChartScore.setText(Html.fromHtml("🏆 Skor Maks: <b><font color='#FFD700'>" + String.format(Locale.US, "%,d", bestScore) + "</font></b> <small><font color='#B0BEC5'>(FC: " + String.format(Locale.US, "%,d", baseScore) + ")</font></small>"));
+                    } else {
+                        tvChartScore.setText(Html.fromHtml("🏆 Skor Maks: <b><font color='#FFD700'>" + String.format(Locale.US, "%,d", bestScore) + "</font></b>"));
+                    }
+                }
+                if (tvChartPathNext != null) {
+                    if (stepTotal > 0) {
+                        if (stepIndex < stepTotal) {
+                            tvChartPathNext.setText(Html.fromHtml("🗺️ Next SP: <b><font color='#76FF03'>Hit #" + nextTargetHit + "</font></b> <small><font color='#00E5FF'>(" + nextReqEnergy + "⚡ Energi)</font> <font color='#FFD700'>[Step " + (stepIndex + 1) + "/" + stepTotal + "]</font></small>"));
+                        } else {
+                            tvChartPathNext.setText(Html.fromHtml("🗺️ Rute SP: <b><font color='#76FF03'>Selesai ✅</font></b> <small><font color='#FFD700'>[" + stepTotal + "/" + stepTotal + "]</font></small>"));
+                        }
+                    } else {
+                        tvChartPathNext.setText(Html.fromHtml("🗺️ Rute SP: <font color='#B0BEC5'>Menghitung...</font>"));
+                    }
+                }
+                if (tvChartPathRoute != null) {
+                    tvChartPathRoute.setText(Html.fromHtml("📋 Rute: <font color='#80D8FF'><b>" + pathSummary + "</b></font>"));
+                }
+            } else {
+                if (tvChartTitle != null) {
+                    tvChartTitle.setText(Html.fromHtml("🎵 <i><font color='#90A4AE'>Menunggu Lagu Dimulai...</font></i>"));
+                }
+                if (tvChartMeta != null) {
+                    tvChartMeta.setText(Html.fromHtml("⏱️ <font color='#90A4AE'>--:-- • 0 Notes</font>"));
+                }
+                if (tvChartSp != null) {
+                    tvChartSp.setText(Html.fromHtml("⭐ Note SP: <font color='#90A4AE'>0 (0 Frase)</font>"));
+                }
+                if (tvChartScore != null) {
+                    tvChartScore.setText(Html.fromHtml("🏆 Skor Maks: <font color='#90A4AE'>-- pts</font>"));
+                }
+                if (tvChartPathNext != null) {
+                    tvChartPathNext.setText(Html.fromHtml("🗺️ Next SP: <font color='#90A4AE'>--</font>"));
+                }
+                if (tvChartPathRoute != null) {
+                    tvChartPathRoute.setText(Html.fromHtml("📋 Rute: <font color='#90A4AE'>--</font>"));
+                }
+            }
+        } catch (Exception e) {
+            log("Error updating chart details: " + e.getMessage());
+        }
+    }
+
     public void updateCounts(int green, int red, int yellow, int blue, int orange, int total, int miss, int autoHits, int autoMaster,
                              int combo, int score) {
         // Only redraw if any number changed
         if (green == pGreen && red == pRed && yellow == pYellow &&
                 blue == pBlue && orange == pOrange && total == pTotal &&
                 miss == pMiss && autoHits == pAuto && autoMaster == pAutoMaster &&
-                combo == pCombo) {
+                combo == pCombo && score == pScore) {
             return;
         }
 
@@ -362,6 +548,7 @@ public class FloatingHUD {
         pAuto = autoHits;
         pAutoMaster = autoMaster;
         pCombo = combo;
+        pScore = score;
 
         tvGreen.setText("🟢 G: " + green);
         tvRed.setText("🔴 R: " + red);
@@ -380,17 +567,18 @@ public class FloatingHUD {
 
         if (tvTitle != null) {
             if (autoMaster == 1) {
-                tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font> <font color='#00E676'><small>[AUTO]</small></font></b>"));
+                tvTitle.setText(Html.fromHtml("<b><font color='#00E5FF'>⚡ NOTE & CHART HUD</font> <font color='#00E676'><small>[AUTO]</small></font></b>"));
             } else {
-                tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font></b>"));
+                tvTitle.setText(Html.fromHtml("<b><font color='#00E5FF'>⚡ NOTE & CHART HUD</font></b>"));
             }
         }
 
-        // Live Combo display
+        // Live Combo & Score display
+        String scoreFormatted = String.format(Locale.US, "%,d", score);
         if (combo >= 30) {
-            tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b> <small><font color='#00E676'>(4x)</font></small>"));
+            tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b> <small><font color='#00E676'>(4x)</font></small> <font color='#90A4AE'>•</font> 🎯 Skor: <b><font color='#00E5FF'>" + scoreFormatted + "</font></b>"));
         } else {
-            tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b>"));
+            tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b> <font color='#90A4AE'>•</font> 🎯 Skor: <b><font color='#00E5FF'>" + scoreFormatted + "</font></b>"));
         }
 
         int allPlayed = total + miss;
