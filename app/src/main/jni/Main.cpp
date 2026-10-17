@@ -130,9 +130,16 @@ static std::atomic<int32_t> g_currentScore{0};
 // Pointers to active game instances
 static void *mainInstance = nullptr;        // Pointer to Main (MonoBehaviour)
 static void *mainNotesInstance = nullptr;   // Pointer to Main_Notes
+static void *mainSpecialInstance = nullptr; // Pointer to Main_Special
 static void *mainScorerInstance = nullptr;  // Pointer to Main_Scorer
 static void *mainFretsInstance = nullptr;   // Pointer to Main_Frets
 static void *g_chartInstance = nullptr;     // Pointer to ed (Chart Manager)
+
+// Special / Star Power Feature (OFF by default)
+static std::atomic<bool> g_instantFullSpecialEnergy{false};
+static void (*GameObject_SetActive)(void *gameObject, bool value, void *methodInfo) = nullptr;
+static void *(*lx_op_Implicit_from_int)(int32_t value, void *methodInfo) = nullptr;
+static int32_t (*lx_op_Implicit_to_int)(void *obscuredInt, void *methodInfo) = nullptr;
 
 // Helper: Inspects active notes in Main_Notes::eoq directly from the engine
 // Returns true if a note on this fret is hit and actively sustaining
@@ -662,6 +669,12 @@ void hook_Main_Update(void *instance) {
     if (instance != nullptr) {
         mainInstance = instance;
 
+        // Main.special: 0xc0
+        void *special = *(void **)((uintptr_t)instance + 0xc0);
+        if (special != nullptr) {
+            mainSpecialInstance = special;
+        }
+
         // Main.frets: 0xc8
         void *frets = *(void **)((uintptr_t)instance + 0xc8);
         if (frets != nullptr) {
@@ -688,9 +701,9 @@ void hook_Main_Update(void *instance) {
 
         if (!g_mainCapturedLogged && notes != nullptr) {
             g_mainCapturedLogged = true;
-            LogDebug("Captured active instances: Main=0x%lx, Frets=0x%lx, Notes=0x%lx, Scorer=0x%lx, Chart=0x%lx",
+            LogDebug("Captured active instances: Main=0x%lx, Frets=0x%lx, Notes=0x%lx, Special=0x%lx, Scorer=0x%lx, Chart=0x%lx",
                      (unsigned long)mainInstance, (unsigned long)mainFretsInstance,
-                     (unsigned long)mainNotesInstance,
+                     (unsigned long)mainNotesInstance, (unsigned long)mainSpecialInstance,
                      (unsigned long)mainScorerInstance, (unsigned long)g_chartInstance);
         }
     }
@@ -748,6 +761,64 @@ void hook_Main_Sounds_cfe(void *instance) {
     }
     if (old_Main_Sounds_cfe != nullptr) {
         old_Main_Sounds_cfe(instance);
+    }
+}
+
+// =========================================================================
+// Instant Full Special Energy Feature (Toggle: OFF by default)
+// =========================================================================
+// 16. Hook Main_Special::bzn (RVA: 0x20b92c0)
+// Called whenever any note is hit to process Special / Star Power phrase progress
+void (*old_Main_Special_bzn)(void *instance, void *hm) = nullptr;
+void hook_Main_Special_bzn(void *instance, void *hm) {
+    if (instance != nullptr) {
+        mainSpecialInstance = instance;
+    }
+
+    if (g_instantFullSpecialEnergy.load() && instance != nullptr && hm != nullptr) {
+        void *sp = *(void **)((uintptr_t)hm + 0x30);
+        if (sp != nullptr && (uintptr_t)sp > 0x10000) {
+            bool starNote = *(bool *)((uintptr_t)sp + 0x10);
+            if (starNote) {
+                // Instantly complete phrase on this single hit
+                int32_t seq = *(int32_t *)((uintptr_t)sp + 0x14);
+                *(int32_t *)((uintptr_t)instance + 0x34) = seq; // currentSequence
+                *(int32_t *)((uintptr_t)instance + 0x38) = 0;   // currentHitsInPhrase = 0
+                *(int32_t *)((uintptr_t)sp + 0x18) = 1;         // sequenceSize = 1
+
+                // Pre-fill energy to 3 so native addition (+1) reaches 4 (100% full)
+                if (lx_op_Implicit_from_int != nullptr) {
+                    *(void **)((uintptr_t)instance + 0x40) = lx_op_Implicit_from_int(3, nullptr);
+                }
+            }
+        }
+    }
+
+    if (old_Main_Special_bzn != nullptr) {
+        old_Main_Special_bzn(instance, hm);
+    }
+
+    if (g_instantFullSpecialEnergy.load() && instance != nullptr && hm != nullptr) {
+        void *sp = *(void **)((uintptr_t)hm + 0x30);
+        if (sp != nullptr && (uintptr_t)sp > 0x10000) {
+            bool starNote = *(bool *)((uintptr_t)sp + 0x10);
+            if (starNote) {
+                // Guarantee 100% full energy (4 bars) and activate button
+                if (lx_op_Implicit_from_int != nullptr) {
+                    *(void **)((uintptr_t)instance + 0x40) = lx_op_Implicit_from_int(4, nullptr);
+                }
+                *(bool *)((uintptr_t)instance + 0x20) = true; // spShow = true
+
+                bool active = *(bool *)((uintptr_t)instance + 0x21);
+                if (!active) {
+                    void *button = *(void **)((uintptr_t)instance + 0xb8);
+                    if (button != nullptr && (uintptr_t)button > 0x10000 && GameObject_SetActive != nullptr) {
+                        GameObject_SetActive(button, true, nullptr);
+                    }
+                }
+                LogDebug("Instant Full Special Energy: Star note hit! Energy filled to 4/4 (100%%) instantly.");
+            }
+        }
     }
 }
 
@@ -929,6 +1000,19 @@ void *hack_thread(void *) {
     HOOK("0x20b8570", hook_Main_Notes_Add, old_Main_Notes_Add);
     LogDebug("Hook Main_Notes::Add (0x20b8570): %s", old_Main_Notes_Add != nullptr ? "SUCCESS" : "FAILED");
 
+    // 16. Hook Main_Special::bzn (0x20b92c0) - Instant Full Special Energy on Star Note Hit
+    HOOK("0x20b92c0", hook_Main_Special_bzn, old_Main_Special_bzn);
+    LogDebug("Hook Main_Special::bzn (0x20b92c0): %s", old_Main_Special_bzn != nullptr ? "SUCCESS" : "FAILED");
+
+    // Resolve Unity GameObject & ObscuredInt methods for Special Energy
+    GameObject_SetActive = reinterpret_cast<void (*)(void *, bool, void *)>(base + 0x3caddcc);
+    lx_op_Implicit_from_int = reinterpret_cast<void *(*)(int32_t, void *)>(base + 0x210d21c);
+    lx_op_Implicit_to_int = reinterpret_cast<int32_t (*)(void *, void *)>(base + 0x210bc94);
+    LogDebug("Resolve Special Energy methods: SetActive=%s, from_int=%s, to_int=%s",
+             GameObject_SetActive != nullptr ? "OK" : "FAIL",
+             lx_op_Implicit_from_int != nullptr ? "OK" : "FAIL",
+             lx_op_Implicit_to_int != nullptr ? "OK" : "FAIL");
+
     // Resolve ed methods for chart lookahead inspection
     ed_Count = reinterpret_cast<int32_t (*)(void *)>(base + 0x1c31f44);
     ed_bad = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1c31f14);
@@ -981,6 +1065,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("Category_⚡ Automation"),
             OBFUSCATE("10_Toggle_Auto Play"),
 
+            OBFUSCATE("Category_⭐ Special & Multiplier"),
+            OBFUSCATE("12_Toggle_Instant Full Special Energy"),
+
             OBFUSCATE("Category_🎵 Songs & Unlocks"),
             OBFUSCATE("20_Toggle_Unlock All Songs"),
 
@@ -992,7 +1079,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>⭐ Instant Special: Energi langsung 100% saat note bintang kena.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1030,6 +1117,13 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             }
             LogDebug("Auto Play toggled: %d", boolean);
             Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Play: AKTIF") : OBFUSCATE("⚡ Auto Play: NONAKTIF"), ToastLength::LENGTH_SHORT);
+            break;
+
+        // Instant Full Special Energy Feature (OFF by default)
+        case 12:
+            g_instantFullSpecialEnergy = boolean;
+            LogDebug("Instant Full Special Energy toggled: %d", boolean);
+            Toast(env, obj, boolean ? OBFUSCATE("⭐ Instant Full Special Energy: AKTIF") : OBFUSCATE("⭐ Instant Full Special Energy: NONAKTIF"), ToastLength::LENGTH_SHORT);
             break;
 
         // Unlock All Songs Feature (OFF by default)
@@ -1079,13 +1173,21 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             int32_t autoTotal = g_totalAutoHits.load();
             int32_t combo = g_currentCombo.load();
 
+            int32_t energyBars = 0;
+            if (mainSpecialInstance != nullptr && lx_op_Implicit_to_int != nullptr) {
+                void *epe = *(void **)((uintptr_t)mainSpecialInstance + 0x40);
+                if (epe != nullptr) {
+                    energyBars = lx_op_Implicit_to_int(epe, nullptr);
+                }
+            }
+
             char statsMsg[512];
             snprintf(statsMsg, sizeof(statsMsg),
-                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n📋 Total Notes: %d",
-                     green, red, yellow, blue, orange, hit, autoTotal, combo, miss, total);
+                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ⭐ Energy: %d/4\n❌ Miss: %d | 📋 Total Notes: %d",
+                     green, red, yellow, blue, orange, hit, autoTotal, combo, energyBars, miss, total);
 
-            LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, Miss=%d",
-                     hit, autoTotal, combo, miss);
+            LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, Energy=%d, Miss=%d",
+                     hit, autoTotal, combo, energyBars, miss);
             Toast(env, obj, statsMsg, ToastLength::LENGTH_LONG);
             break;
         }
