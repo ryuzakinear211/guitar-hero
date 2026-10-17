@@ -48,7 +48,6 @@ public class FloatingHUD {
     private TextView tvTotal;
     private TextView tvAcc;
     private TextView tvCombo;
-    private TextView tvSpecial;
 
     private Handler mHandler;
     private Runnable mUpdateRunnable;
@@ -58,8 +57,7 @@ public class FloatingHUD {
     // Previous values cache to avoid redundant updates
     private int pGreen = -1, pRed = -1, pYellow = -1, pBlue = -1, pOrange = -1;
     private int pMiss = -1, pTotal = -1;
-    private int pCombo = -1, pSpecialActive = -1, pSpecialEnergy = -1;
-    private int pAutoSp = -1, pActivations = -1;
+    private int pCombo = -1;
 
     public FloatingHUD(Context context) {
         this.mContext = context;
@@ -236,7 +234,7 @@ public class FloatingHUD {
         divider3.setLayoutParams(divParams3);
         mCard.addView(divider3);
 
-        // Row 4: Live Combo and Special Ability Status
+        // Row 4: Live Combo
         LinearLayout row4 = new LinearLayout(mContext);
         row4.setOrientation(LinearLayout.HORIZONTAL);
         row4.setGravity(Gravity.CENTER_VERTICAL);
@@ -247,16 +245,10 @@ public class FloatingHUD {
         tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>0</font></b>"));
         tvCombo.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
         tvCombo.setTextColor(Color.parseColor("#ECEFF1"));
-        tvCombo.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
-
-        tvSpecial = new TextView(mContext);
-        tvSpecial.setText(Html.fromHtml("⭐ SP: <b><font color='#90A4AE'>OFF</font></b>"));
-        tvSpecial.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
-        tvSpecial.setTextColor(Color.parseColor("#ECEFF1"));
-        tvSpecial.setGravity(Gravity.END);
+        tvCombo.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         row4.addView(tvCombo);
-        row4.addView(tvSpecial);
         mCard.addView(row4);
 
         mRootView.addView(mCard);
@@ -335,15 +327,10 @@ public class FloatingHUD {
                             int miss = stats[6];
                             int autoHits = stats.length >= 9 ? stats[8] : 0;
                             int autoMaster = stats.length >= 10 ? stats[9] : 0;
-                            int spActive = stats.length >= 11 ? stats[10] : 0;
-                            int spEnergy = stats.length >= 12 ? stats[11] : 0;
-                            int combo = stats.length >= 13 ? stats[12] : 0;
-                            int score = stats.length >= 14 ? stats[13] : 0;
-                            int autoSp = stats.length >= 15 ? stats[14] : 0;
-                            int activations = stats.length >= 16 ? stats[15] : 0;
+                            int combo = stats.length >= 11 ? stats[10] : 0;
+                            int score = stats.length >= 12 ? stats[11] : 0;
 
-                            updateCounts(green, red, yellow, blue, orange, total, miss, autoHits, autoMaster,
-                                         spActive, spEnergy, combo, score, autoSp, activations);
+                            updateCounts(green, red, yellow, blue, orange, total, miss, autoHits, autoMaster, combo, score);
                         }
                     } catch (Throwable t) {
                         log("Error updating stats: " + t.getMessage());
@@ -356,13 +343,12 @@ public class FloatingHUD {
     }
 
     public void updateCounts(int green, int red, int yellow, int blue, int orange, int total, int miss, int autoHits, int autoMaster,
-                             int spActive, int spEnergy, int combo, int score, int autoSp, int activations) {
+                             int combo, int score) {
         // Only redraw if any number changed
         if (green == pGreen && red == pRed && yellow == pYellow &&
                 blue == pBlue && orange == pOrange && total == pTotal &&
                 miss == pMiss && autoHits == pAuto && autoMaster == pAutoMaster &&
-                spActive == pSpecialActive && spEnergy == pSpecialEnergy &&
-                combo == pCombo && autoSp == pAutoSp && activations == pActivations) {
+                combo == pCombo) {
             return;
         }
 
@@ -375,11 +361,7 @@ public class FloatingHUD {
         pMiss = miss;
         pAuto = autoHits;
         pAutoMaster = autoMaster;
-        pSpecialActive = spActive;
-        pSpecialEnergy = spEnergy;
         pCombo = combo;
-        pAutoSp = autoSp;
-        pActivations = activations;
 
         tvGreen.setText("🟢 G: " + green);
         tvRed.setText("🔴 R: " + red);
@@ -397,12 +379,8 @@ public class FloatingHUD {
         }
 
         if (tvTitle != null) {
-            if (autoMaster == 1 && spActive == 1) {
-                tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font> <font color='#FF007F'><small>[8x AUTO SP]</small></font></b>"));
-            } else if (autoMaster == 1) {
+            if (autoMaster == 1) {
                 tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font> <font color='#00E676'><small>[AUTO]</small></font></b>"));
-            } else if (spActive == 1) {
-                tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font> <font color='#FF007F'><small>[8x SP]</small></font></b>"));
             } else {
                 tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font></b>"));
             }
@@ -413,21 +391,6 @@ public class FloatingHUD {
             tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b> <small><font color='#00E676'>(4x)</font></small>"));
         } else {
             tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b>"));
-        }
-
-        // Special Ability Status display
-        if (spActive == 1) {
-            tvSpecial.setText(Html.fromHtml("⭐ <b><font color='#FF007F'>8x ACTIVE!</font></b>"));
-        } else if (autoSp == 1) {
-            if (spEnergy >= 2) {
-                tvSpecial.setText(Html.fromHtml("⭐ SP: <b><font color='#76FF03'>READY [" + spEnergy + "/4]</font></b>"));
-            } else {
-                tvSpecial.setText(Html.fromHtml("⭐ SP: <b><font color='#00E5FF'>PATH [" + spEnergy + "/4]</font></b>"));
-            }
-        } else if (spEnergy >= 2) {
-            tvSpecial.setText(Html.fromHtml("⭐ SP: <b><font color='#FFEA00'>[" + spEnergy + "/4 Ready]</font></b>"));
-        } else {
-            tvSpecial.setText(Html.fromHtml("⭐ SP: <b><font color='#90A4AE'>[" + spEnergy + "/4]</font></b>"));
         }
 
         int allPlayed = total + miss;

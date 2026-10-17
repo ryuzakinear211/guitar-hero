@@ -119,101 +119,25 @@ static std::atomic<bool> g_autoPlay{false};       // Master switch for Auto Play
 // Per-fret internal trackers (frets 0..4)
 static std::atomic<int> g_fretVisualTimer[5]{0, 0, 0, 0, 0};
 static std::atomic<bool> g_fretSustaining[5]{false, false, false, false, false};
-static std::atomic<int> g_fretSustainFrames[5]{0, 0, 0, 0, 0};
+static float g_fretSustainStartTime[5]{0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+static float g_fretSustainEndTime[5]{0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 static std::atomic<int32_t> g_autoHitsCount[5]{0, 0, 0, 0, 0};
 static std::atomic<int32_t> g_totalAutoHits{0};
+
+// Live combo and score trackers
+static std::atomic<int32_t> g_currentCombo{0};
+static std::atomic<int32_t> g_currentScore{0};
 
 // Pointers to active game instances
 static void *mainInstance = nullptr;        // Pointer to Main (MonoBehaviour)
 static void *mainNotesInstance = nullptr;   // Pointer to Main_Notes
 static void *mainScorerInstance = nullptr;  // Pointer to Main_Scorer
 static void *mainFretsInstance = nullptr;   // Pointer to Main_Frets
-static void *mainSpecialInstance = nullptr; // Pointer to Main_Special (MonoBehaviour)
+static void *g_chartInstance = nullptr;     // Pointer to ed (Chart Manager)
 
-// =========================================================================
-// Auto Special Ability (Chart-Aware Smart Pathing) State
-// =========================================================================
-static std::atomic<bool> g_autoSpecial{false};               // Master toggle: Auto Special Ability
-static std::atomic<bool> g_isSpecialActive{false};          // Live status: is Special active?
-static std::atomic<int32_t> g_currentCombo{0};              // Current live streak / combo count
-static std::atomic<int32_t> g_currentScore{0};              // Current total score
-static std::atomic<int32_t> g_lastActivatedAtNote{-1};      // Hit count at last activation to prevent double fire
-static std::atomic<int32_t> g_totalSpecialActivations{0};   // Total successful activations count
-static std::atomic<int32_t> g_specialEnergyLevel{0};        // Current natural SP energy (0..4)
-
-// =========================================================================
-// Deterministic Smart Path & Milestone System
-// =========================================================================
-struct SpPathMilestone {
-    int32_t targetHit;       // The exact hit count (or combo) where ability is triggered
-    int32_t requiredEnergy;  // Required energy bars (2, 3, or 4)
-};
-
-// Competitive chart path for Dragonforce - Through the Fire and Flames (Hard mode)
-// Path:  2    2    2    2    2    2    2     3     3     2     2     2     4
-// Kombo: 128  294  456  589  825  969  1095  1366  1823  2018  2152  2259  2607
-static const std::vector<SpPathMilestone> DRAGONFORCE_HARD_PATH = {
-    {128, 2},
-    {294, 2},
-    {456, 2},
-    {589, 2},
-    {825, 2},
-    {969, 2},
-    {1095, 2},
-    {1366, 3},
-    {1823, 3},
-    {2018, 2},
-    {2152, 2},
-    {2259, 2},
-    {2607, 4}
-};
-
-static std::vector<SpPathMilestone> g_activePathMilestones;
-static std::atomic<size_t> g_currentPathStep{0};
-static std::atomic<bool> g_isDragonforceSong{false};
-static std::string g_currentSongName = "";
-
-// Cached Song Notes from Chart & Add hooks
-struct CachedSongNote {
-    int32_t num;
-    float time;
-    float duration;
-    int32_t special; // 1 if Star Power note, 0 otherwise
-};
-static std::vector<CachedSongNote> g_cachedChartNotes;
-static pthread_mutex_t g_chartNotesMutex = PTHREAD_MUTEX_INITIALIZER;
-static std::atomic<bool> g_starPhraseInProgress{false};
-static void *g_chartInstance = nullptr; // Pointer to ed (Chart Manager)
-
-// Circular buffer for calculating real-time note density (notes per second)
-static const int DENSITY_BUFFER_SIZE = 16;
-static float g_recentHitTimes[DENSITY_BUFFER_SIZE] = {0};
-static int g_recentHitIndex = 0;
-static int g_recentHitCount = 0;
-static pthread_mutex_t g_pathMutex = PTHREAD_MUTEX_INITIALIZER;
-
-static void RecordHitTime(float time) {
-    pthread_mutex_lock(&g_pathMutex);
-    g_recentHitTimes[g_recentHitIndex % DENSITY_BUFFER_SIZE] = time;
-    g_recentHitIndex++;
-    if (g_recentHitCount < DENSITY_BUFFER_SIZE) {
-        g_recentHitCount++;
-    }
-    pthread_mutex_unlock(&g_pathMutex);
-}
-
-static float CalculateNoteDensity(float currentSongTime) {
-    pthread_mutex_lock(&g_pathMutex);
-    int count = 0;
-    for (int i = 0; i < g_recentHitCount; i++) {
-        float t = g_recentHitTimes[i];
-        if (currentSongTime - t >= 0.0f && currentSongTime - t <= 1.5f) {
-            count++;
-        }
-    }
-    pthread_mutex_unlock(&g_pathMutex);
-    return (float)count / 1.5f;
-}
+// Cached note durations from chart (indexed by note num)
+static std::vector<float> g_noteDurations;
+static pthread_mutex_t g_noteDurationsMutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Color-specific note hit counters:
 // Fret 0 = Green, 1 = Red, 2 = Yellow, 3 = Blue, 4 = Orange
@@ -317,31 +241,20 @@ static void resetAllNoteCounters() {
     for (int i = 0; i < 5; i++) {
         g_fretVisualTimer[i] = 0;
         g_fretSustaining[i] = false;
-        g_fretSustainFrames[i] = 0;
+        g_fretSustainStartTime[i] = 0.0f;
+        g_fretSustainEndTime[i] = 0.0f;
         g_autoHitsCount[i] = 0;
         if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
             old_Main_Frets_byc(mainFretsInstance, i, false);
         }
     }
     g_totalAutoHits = 0;
-
-    g_lastActivatedAtNote = -1;
-    g_totalSpecialActivations = 0;
     g_currentCombo = 0;
     g_currentScore = 0;
-    g_isSpecialActive = false;
-    g_starPhraseInProgress = false;
 
-    pthread_mutex_lock(&g_chartNotesMutex);
-    g_cachedChartNotes.clear();
-    pthread_mutex_unlock(&g_chartNotesMutex);
-
-    pthread_mutex_lock(&g_pathMutex);
-    g_activePathMilestones.clear();
-    g_currentPathStep = 0;
-    g_recentHitCount = 0;
-    g_recentHitIndex = 0;
-    pthread_mutex_unlock(&g_pathMutex);
+    pthread_mutex_lock(&g_noteDurationsMutex);
+    g_noteDurations.clear();
+    pthread_mutex_unlock(&g_noteDurationsMutex);
 
     if (mainNotesInstance != nullptr) {
         *(int32_t *)((uintptr_t)mainNotesInstance + 0x64) = 0; // acertadas
@@ -349,7 +262,7 @@ static void resetAllNoteCounters() {
         *(int32_t *)((uintptr_t)mainNotesInstance + 0x6c) = 0; // erradas
         *(int32_t *)((uintptr_t)mainNotesInstance + 0x70) = 0; // perdidas
     }
-    LogDebug("User reset all note counters, auto-hit and special path stats to 0");
+    LogDebug("User reset all note counters and auto-hit stats to 0");
 }
 
 // =========================================================================
@@ -364,330 +277,31 @@ struct Vector3 {
 
 static void *(*Component_get_transform)(void *component) = nullptr;
 static Vector3 (*Transform_get_position)(void *transform) = nullptr;
-// Function pointers for Special Ability & Obscured types
-static void (*Main_Special_bzk)(void *instance, bool a) = nullptr;
-static void (*old_Main_Special_bzk)(void *instance, bool a) = nullptr;
-static void (*Main_Special_bzl)(void *instance) = nullptr;
-static void (*old_Main_Special_bzl)(void *instance) = nullptr;
-static int32_t (*lx_op_Implicit_to_int)(void *obscuredInt) = nullptr;
-static void *(*lx_op_Implicit_from_int)(int32_t value) = nullptr;
-
 // Function pointers for Chart & Note inspection
 static int32_t (*ed_Count)(void *instance) = nullptr;
 static void *(*ed_bad)(void *instance, int32_t a) = nullptr;
 
-// Helper to convert an Il2Cpp System.String to std::string
-static std::string Il2CppStringToStdString(void *il2cppString) {
-    if (il2cppString == nullptr) return "";
-    int32_t len = *(int32_t *)((uintptr_t)il2cppString + 0x10);
-    if (len <= 0 || len > 512) return "";
-    const uint16_t *chars = (const uint16_t *)((uintptr_t)il2cppString + 0x14);
-    std::string result;
-    result.reserve(len);
-    for (int i = 0; i < len; i++) {
-        uint16_t ch = chars[i];
-        if (ch < 128) {
-            result.push_back((char)ch);
-        } else {
-            result.push_back('?');
-        }
-    }
-    return result;
-}
-
-// Hook ed::bab (Chart loader & Song detector)
-static void (*old_ed_bab)(void *instance, int32_t a, void *b, int32_t c, void *d, void *e) = nullptr;
-static void hook_ed_bab(void *instance, int32_t a, void *b, int32_t c, void *d, void *e) {
-    if (instance != nullptr) {
-        g_chartInstance = instance;
-        LogDebug("ed::bab hooked: Captured g_chartInstance=0x%lx", (unsigned long)instance);
-    }
-    if (b != nullptr) {
-        std::string songStr = Il2CppStringToStdString(b);
-        g_currentSongName = songStr;
-        std::string lowerStr = songStr;
-        for (char &ch : lowerStr) ch = ::tolower(ch);
-        LogDebug("ed::bab song identifier: '%s'", songStr.c_str());
-        if (lowerStr.find("dragonforce") != std::string::npos ||
-            lowerStr.find("through the fire") != std::string::npos ||
-            lowerStr.find("fire and flames") != std::string::npos ||
-            lowerStr.find("ttfaf") != std::string::npos) {
-            g_isDragonforceSong = true;
-            LogDebug("Dragonforce TTFAF identified from song identifier!");
-        } else {
-            g_isDragonforceSong = false;
-        }
-    }
-    if (old_ed_bab != nullptr) {
-        old_ed_bab(instance, a, b, c, d, e);
-    }
-}
-
-// Hook Main_Notes::Add (Real-time Note Recorder)
+// Hook Main_Notes::Add (Real-time Note Recorder for durations)
 static void (*old_Main_Notes_Add)(void *instance, int32_t num, void *noteChart) = nullptr;
 static void hook_Main_Notes_Add(void *instance, int32_t num, void *noteChart) {
     if (instance != nullptr) {
         mainNotesInstance = instance;
     }
-    if (noteChart != nullptr) {
-        float nTime = *(float *)((uintptr_t)noteChart + 0x14);
+    if (noteChart != nullptr && num >= 0 && num < 20000) {
         float nDur = *(float *)((uintptr_t)noteChart + 0x18);
-        int32_t nSp = *(int32_t *)((uintptr_t)noteChart + 0x1c);
-        pthread_mutex_lock(&g_chartNotesMutex);
+        pthread_mutex_lock(&g_noteDurationsMutex);
         if (num == 0) {
-            g_cachedChartNotes.clear();
+            g_noteDurations.clear();
         }
-        g_cachedChartNotes.push_back({num, nTime, nDur, nSp});
-        pthread_mutex_unlock(&g_chartNotesMutex);
+        if ((size_t)num >= g_noteDurations.size()) {
+            g_noteDurations.resize(num + 1, 0.0f);
+        }
+        g_noteDurations[num] = nDur;
+        pthread_mutex_unlock(&g_noteDurationsMutex);
     }
     if (old_Main_Notes_Add != nullptr) {
         old_Main_Notes_Add(instance, num, noteChart);
     }
-}
-
-// Build deterministic, non-random Star Power path milestones for any chart
-static void BuildSmartPathForChart() {
-    pthread_mutex_lock(&g_chartNotesMutex);
-    std::vector<CachedSongNote> notes = g_cachedChartNotes;
-    pthread_mutex_unlock(&g_chartNotesMutex);
-
-    pthread_mutex_lock(&g_pathMutex);
-    g_activePathMilestones.clear();
-    g_currentPathStep = 0;
-
-    // Check if current song is Dragonforce TTFAF (either via name or characteristic note count > 2500)
-    bool isDragonforce = g_isDragonforceSong.load();
-    if (!isDragonforce && notes.size() >= 2500) {
-        isDragonforce = true;
-        g_isDragonforceSong = true;
-    }
-
-    if (isDragonforce) {
-        g_activePathMilestones = DRAGONFORCE_HARD_PATH;
-        pthread_mutex_unlock(&g_pathMutex);
-        LogDebug("⭐ [SmartPath] Dragonforce TTFAF active! Loaded %zu competitive chart milestones:",
-                 g_activePathMilestones.size());
-        for (size_t i = 0; i < g_activePathMilestones.size(); i++) {
-            LogDebug("  [Dragonforce Step %zu] Trigger at Hit/Combo: %d | Req Energy: %d bars",
-                     i + 1, g_activePathMilestones[i].targetHit, g_activePathMilestones[i].requiredEnergy);
-        }
-        return;
-    }
-
-    if (notes.empty()) {
-        pthread_mutex_unlock(&g_pathMutex);
-        LogDebug("[SmartPath] Notes cache empty, awaiting chart load...");
-        return;
-    }
-
-    // Group Star Power notes into contiguous phrases
-    struct SpPhrase {
-        int32_t startNote;
-        int32_t endNote;
-        float startTime;
-        float endTime;
-    };
-    std::vector<SpPhrase> phrases;
-
-    bool inPhrase = false;
-    SpPhrase curPhrase = {0, 0, 0.0f, 0.0f};
-
-    for (size_t i = 0; i < notes.size(); i++) {
-        if (notes[i].special == 1) {
-            if (!inPhrase) {
-                inPhrase = true;
-                curPhrase.startNote = notes[i].num;
-                curPhrase.startTime = notes[i].time;
-            }
-            curPhrase.endNote = notes[i].num;
-            curPhrase.endTime = notes[i].time + notes[i].duration;
-        } else {
-            if (inPhrase) {
-                inPhrase = false;
-                phrases.push_back(curPhrase);
-            }
-        }
-    }
-    if (inPhrase) {
-        phrases.push_back(curPhrase);
-    }
-
-    LogDebug("[SmartPath] Chart analyzed: %zu total notes, %zu Star Power phrases detected",
-             notes.size(), phrases.size());
-
-    if (phrases.empty()) {
-        // Fallback for custom charts without SP phrases: milestones spaced across song
-        for (int32_t h = 120; h < (int32_t)notes.size() - 50; h += 200) {
-            g_activePathMilestones.push_back({h, 2});
-        }
-        pthread_mutex_unlock(&g_pathMutex);
-        return;
-    }
-
-    // Deterministic simulation: schedule activations at exact phrase ends where window is clear
-    int32_t simEnergy = 0;
-    float simActivationEndTime = -1.0f;
-
-    for (size_t p = 0; p < phrases.size(); p++) {
-        const auto &ph = phrases[p];
-        if (ph.startTime < simActivationEndTime) {
-            // Overlapped by previous active Special, phrase not banked
-            continue;
-        }
-
-        if (simEnergy < 4) {
-            simEnergy++;
-        }
-
-        if (simEnergy >= 2) {
-            bool hasNextPhrase = (p + 1 < phrases.size());
-            float nextPhraseStart = hasNextPhrase ? phrases[p + 1].startTime : 999999.0f;
-            float duration = (float)simEnergy * 3.75f;
-            float proposedEndTime = ph.endTime + duration + 0.6f;
-
-            bool shouldSchedule = false;
-            if (simEnergy >= 4) {
-                // Bar full, must activate to prevent waste
-                shouldSchedule = true;
-            } else if (!hasNextPhrase) {
-                // Outro, no more phrases
-                shouldSchedule = true;
-            } else if (proposedEndTime <= nextPhraseStart) {
-                // Clean window without clipping upcoming SP phrase!
-                shouldSchedule = true;
-            }
-
-            if (shouldSchedule) {
-                int32_t targetHit = ph.endNote;
-                if (targetHit < 30) targetHit = 30; // 4x multiplier threshold
-                g_activePathMilestones.push_back({targetHit, simEnergy});
-                simActivationEndTime = ph.endTime + duration;
-                simEnergy = 0;
-            }
-        }
-    }
-
-    // Outro check: if energy remained at end of song
-    if (simEnergy >= 2 && !notes.empty()) {
-        int32_t outroHit = notes.back().num - 30;
-        if (outroHit > 30) {
-            g_activePathMilestones.push_back({outroHit, simEnergy});
-        }
-    }
-
-    pthread_mutex_unlock(&g_pathMutex);
-
-    LogDebug("⭐ [SmartPath] Generated %zu deterministic milestones for '%s':",
-             g_activePathMilestones.size(), g_currentSongName.c_str());
-    for (size_t i = 0; i < g_activePathMilestones.size(); i++) {
-        LogDebug("  [Step %zu] Trigger at Hit/Combo: %d | Req Energy: %d bars",
-                 i + 1, g_activePathMilestones[i].targetHit, g_activePathMilestones[i].requiredEnergy);
-    }
-}
-
-// Deterministic Smart Path Trigger:
-// Activates Special Ability PRECISELY when the song hit count / combo reaches the charted milestone.
-// Zero randomness. Completely aligned with hit milestones and natural energy!
-static void CheckAndTriggerSmartSpecial(float songTime) {
-    if (!g_autoSpecial.load()) {
-        return;
-    }
-
-    if (mainSpecialInstance == nullptr) {
-        if (mainInstance != nullptr) {
-            mainSpecialInstance = *(void **)((uintptr_t)mainInstance + 0xc0);
-        }
-        if (mainSpecialInstance == nullptr && mainNotesInstance != nullptr) {
-            mainSpecialInstance = *(void **)((uintptr_t)mainNotesInstance + 0x88);
-        }
-    }
-    if (mainSpecialInstance == nullptr) {
-        return;
-    }
-
-    // Check if Special is already active
-    bool active = *(bool *)((uintptr_t)mainSpecialInstance + 0x21);
-    g_isSpecialActive = active;
-    if (active) {
-        return; // Already enjoying 8x multiplier!
-    }
-
-    // Read natural energy level from epe (0x40)
-    void *epe = *(void **)((uintptr_t)mainSpecialInstance + 0x40);
-    int32_t currentEnergy = 0;
-    if (epe != nullptr && lx_op_Implicit_to_int != nullptr) {
-        currentEnergy = lx_op_Implicit_to_int(epe);
-    }
-    g_specialEnergyLevel = currentEnergy;
-
-    // Minimum energy required by game engine to activate is 2 bars (50%)
-    if (currentEnergy < 2) {
-        return;
-    }
-
-    int32_t combo = g_currentCombo.load();
-    int32_t hits = getNotesHit();
-
-    // Prevent rapid re-triggering at the exact same hit count
-    if (g_lastActivatedAtNote.load() >= 0 && (hits - g_lastActivatedAtNote.load()) < 10) {
-        return;
-    }
-
-    // Multiplier safety: ensure combo >= 30 for 4x base multiplier -> 8x
-    if (combo < 30) {
-        return;
-    }
-
-    // Hold if Star Power phrase is actively in progress
-    if (currentEnergy < 4 && g_starPhraseInProgress.load()) {
-        return;
-    }
-
-    pthread_mutex_lock(&g_pathMutex);
-    if (g_activePathMilestones.empty()) {
-        pthread_mutex_unlock(&g_pathMutex);
-        BuildSmartPathForChart();
-        pthread_mutex_lock(&g_pathMutex);
-    }
-
-    size_t stepIdx = g_currentPathStep.load();
-    if (stepIdx >= g_activePathMilestones.size()) {
-        pthread_mutex_unlock(&g_pathMutex);
-        return; // All scheduled milestones completed
-    }
-
-    const SpPathMilestone step = g_activePathMilestones[stepIdx];
-    pthread_mutex_unlock(&g_pathMutex);
-
-    // EXACT HIT / COMBO MILESTONE CHECK:
-    // Ability must trigger WHEN hit count or combo reaches the scheduled milestone!
-    // Never trigger at random hit counts!
-    if (hits < step.targetHit && combo < step.targetHit) {
-        return; // Milestone hit count not reached yet
-    }
-
-    // Energy requirement check: must have at least the required bars
-    if (currentEnergy < step.requiredEnergy) {
-        return; // Natural energy not filled to required bars yet
-    }
-
-    // TRIGGER SPECIAL ABILITY PRECISELY AT THIS MILESTONE!
-    *(float *)((uintptr_t)mainSpecialInstance + 0x24) = 0.0f; // timeBlocked = 0
-    *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true;  // spShow = true
-
-    if (old_Main_Special_bzk != nullptr) {
-        old_Main_Special_bzk(mainSpecialInstance, false);
-    } else if (Main_Special_bzk != nullptr) {
-        Main_Special_bzk(mainSpecialInstance, false);
-    }
-
-    g_isSpecialActive = true;
-    g_lastActivatedAtNote = hits;
-    g_totalSpecialActivations++;
-    g_currentPathStep++; // Advance to next scheduled milestone!
-
-    LogDebug("⭐ [SmartSpecial] Path Step #%zu TRIGGERED at Hit #%d (Target: %d) | Combo: %d | Natural Energy: %d/%d bars | Total Activations: %d",
-             stepIdx + 1, hits, step.targetHit, combo, currentEnergy, step.requiredEnergy, g_totalSpecialActivations.load());
 }
 
 // 1. Hook Main_Scorer::cdc (RVA: 0x20c38a0)
@@ -701,34 +315,6 @@ void hook_Main_Scorer_cdc(void *instance, int32_t a, int32_t b) {
     if (old_Main_Scorer_cdc != nullptr) {
         return old_Main_Scorer_cdc(instance, a, b);
     }
-}
-
-// Hook Main_Special::bzk (RVA: 0x20bae98) - Special Ability Activation
-void hook_Main_Special_bzk(void *instance, bool a) {
-    if (instance != nullptr) {
-        mainSpecialInstance = instance;
-    }
-    if (old_Main_Special_bzk != nullptr) {
-        old_Main_Special_bzk(instance, a);
-    }
-    if (instance != nullptr) {
-        g_isSpecialActive = *(bool *)((uintptr_t)instance + 0x21);
-    } else {
-        g_isSpecialActive = true;
-    }
-    LogDebug("[SpecialHook] bzk invoked: isSpecialActive=%d", g_isSpecialActive.load() ? 1 : 0);
-}
-
-// Hook Main_Special::bzl (RVA: 0x20bb068) - Special Ability Deactivation
-void hook_Main_Special_bzl(void *instance) {
-    if (instance != nullptr) {
-        mainSpecialInstance = instance;
-    }
-    if (old_Main_Special_bzl != nullptr) {
-        old_Main_Special_bzl(instance);
-    }
-    g_isSpecialActive = false;
-    LogDebug("[SpecialHook] bzl invoked: Special ended, multiplier reverted to normal");
 }
 
 // 2. Hook Main_Notes::byy (RVA: 0x20b8fec)
@@ -760,7 +346,7 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
             }
         }
 
-        // Track sustain notes (rastro: offset 0x28) (from commit e4947d)
+        // Track sustain notes (rastro: offset 0x28)
         if (fret >= 0 && fret < 5) {
             void *rastro = *(void **)((uintptr_t)hm + 0x28);
             bool hasRastro = false;
@@ -768,28 +354,55 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
                 // bool has: offset 0x20
                 hasRastro = *(bool *)((uintptr_t)rastro + 0x20);
             }
-            g_fretSustaining[fret] = hasRastro;
-            g_fretSustainFrames[fret] = 0;
-        }
 
-        // Track live Star Power phrase progress
-        void *spObj = *(void **)((uintptr_t)hm + 0x30); // Special* at 0x30
-        if (spObj != nullptr) {
-            bool isStar = *(bool *)((uintptr_t)spObj + 0x10);
-            int32_t seq = *(int32_t *)((uintptr_t)spObj + 0x14);
-            int32_t seqSize = *(int32_t *)((uintptr_t)spObj + 0x18);
-            if (isStar) {
-                if (seqSize > 0 && seq < seqSize) {
-                    g_starPhraseInProgress = true;
-                } else if (seqSize > 0 && seq >= seqSize) {
-                    g_starPhraseInProgress = false; // Phrase completed!
+            if (hasRastro) {
+                float duration = 0.0f;
+                // 1. Look up charted duration from g_noteDurations
+                pthread_mutex_lock(&g_noteDurationsMutex);
+                if (num >= 0 && (size_t)num < g_noteDurations.size()) {
+                    duration = g_noteDurations[num];
                 }
+                pthread_mutex_unlock(&g_noteDurationsMutex);
+
+                // 2. Fallback: look up directly from chart array if needed
+                if (duration <= 0.01f && g_chartInstance != nullptr) {
+                    void *dya = *(void **)((uintptr_t)g_chartInstance + 0x20);
+                    if (dya != nullptr) {
+                        int32_t count = *(int32_t *)((uintptr_t)dya + 0x18);
+                        if (num >= 0 && num < count) {
+                            void *nc = *(void **)((uintptr_t)dya + 0x20 + num * sizeof(void *));
+                            if (nc != nullptr) {
+                                duration = *(float *)((uintptr_t)nc + 0x18);
+                            }
+                        }
+                    }
+                }
+
+                // 3. Fallback: call ed_bad if needed
+                if (duration <= 0.01f && ed_bad != nullptr && g_chartInstance != nullptr) {
+                    void *nc = ed_bad(g_chartInstance, num);
+                    if (nc != nullptr) {
+                        duration = *(float *)((uintptr_t)nc + 0x18);
+                    }
+                }
+
+                // 4. Safe fallback duration for sustain note
+                if (duration <= 0.01f) {
+                    duration = 0.35f;
+                }
+
+                g_fretSustaining[fret] = true;
+                g_fretSustainStartTime[fret] = b;
+                g_fretSustainEndTime[fret] = b + duration;
+                LogDebug("Sustain START: fret=%d, num=%d, duration=%.2fs, endTime=%.2fs", fret, num, duration, b + duration);
+            } else {
+                // Normal tap note (no sustain trail)
+                g_fretSustaining[fret] = false;
+                g_fretSustainStartTime[fret] = 0.0f;
+                g_fretSustainEndTime[fret] = 0.0f;
             }
         }
     }
-
-    RecordHitTime(b);
-    CheckAndTriggerSmartSpecial(b);
 
     if (old_Main_Notes_byy != nullptr) {
         old_Main_Notes_byy(instance, hm, b);
@@ -851,7 +464,8 @@ void hook_Main_Notes_byz(void *instance, void *hm) {
         }
         if (fret >= 0 && fret < 5) {
             g_fretSustaining[fret] = false;
-            g_fretSustainFrames[fret] = 0;
+            g_fretSustainStartTime[fret] = 0.0f;
+            g_fretSustainEndTime[fret] = 0.0f;
             g_fretVisualTimer[fret] = 0;
             if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                 old_Main_Frets_byc(mainFretsInstance, fret, false);
@@ -874,18 +488,9 @@ void hook_Main_Notes_byv(void *instance) {
         mainNotesInstance = instance;
     }
 
-    pthread_mutex_lock(&g_chartNotesMutex);
-    g_cachedChartNotes.clear();
-    pthread_mutex_unlock(&g_chartNotesMutex);
-
-    pthread_mutex_lock(&g_pathMutex);
-    g_activePathMilestones.clear();
-    g_currentPathStep = 0;
-    pthread_mutex_unlock(&g_pathMutex);
-
-    g_starPhraseInProgress = false;
-    g_lastActivatedAtNote = -1;
-    g_totalSpecialActivations = 0;
+    pthread_mutex_lock(&g_noteDurationsMutex);
+    g_noteDurations.clear();
+    pthread_mutex_unlock(&g_noteDurationsMutex);
 
     g_greenHits = 0;
     g_redHits = 0;
@@ -903,7 +508,8 @@ void hook_Main_Notes_byv(void *instance) {
     for (int i = 0; i < 5; i++) {
         g_fretVisualTimer[i] = 0;
         g_fretSustaining[i] = false;
-        g_fretSustainFrames[i] = 0;
+        g_fretSustainStartTime[i] = 0.0f;
+        g_fretSustainEndTime[i] = 0.0f;
         g_autoHitsCount[i] = 0;
         if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
             old_Main_Frets_byc(mainFretsInstance, i, false);
@@ -926,7 +532,8 @@ void hook_Main_Notes_bzc(void *instance, void *hm) {
         int32_t fret = *(int32_t *)((uintptr_t)hm + 0x3c);
         if (fret >= 0 && fret < 5) {
             g_fretSustaining[fret] = false;
-            g_fretSustainFrames[fret] = 0;
+            g_fretSustainStartTime[fret] = 0.0f;
+            g_fretSustainEndTime[fret] = 0.0f;
             g_fretVisualTimer[fret] = 0;
             if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                 old_Main_Frets_byc(mainFretsInstance, fret, false); // Release visual fret
@@ -1069,12 +676,6 @@ void hook_Main_Update(void *instance) {
             mainNotesInstance = notes;
         }
 
-        // Main.special: 0xc0
-        void *special = *(void **)((uintptr_t)instance + 0xc0);
-        if (special != nullptr) {
-            mainSpecialInstance = special;
-        }
-
         // Main.scorer: 0x110
         void *scorer = *(void **)((uintptr_t)instance + 0x110);
         if (scorer != nullptr) {
@@ -1089,37 +690,43 @@ void hook_Main_Update(void *instance) {
 
         if (!g_mainCapturedLogged && notes != nullptr) {
             g_mainCapturedLogged = true;
-            LogDebug("Captured active instances: Main=0x%lx, Frets=0x%lx, Notes=0x%lx, Special=0x%lx, Scorer=0x%lx, Chart=0x%lx",
+            LogDebug("Captured active instances: Main=0x%lx, Frets=0x%lx, Notes=0x%lx, Scorer=0x%lx, Chart=0x%lx",
                      (unsigned long)mainInstance, (unsigned long)mainFretsInstance,
-                     (unsigned long)mainNotesInstance, (unsigned long)mainSpecialInstance,
+                     (unsigned long)mainNotesInstance,
                      (unsigned long)mainScorerInstance, (unsigned long)g_chartInstance);
         }
     }
 
-    // Evaluate Auto Special Ability smart pathing
     float songTime = 0.0f;
     if (mainInstance != nullptr) {
         songTime = *(float *)((uintptr_t)mainInstance + 0x28);
     }
-    CheckAndTriggerSmartSpecial(songTime);
 
-    // Manage visual fret release timers for tap notes & safety cap for sustain
+    // Manage visual fret release timers for tap notes & precise duration release for sustain
     for (int i = 0; i < 5; i++) {
+        // A. Release sustain hold when note tail finishes
+        if (g_fretSustaining[i].load()) {
+            if (songTime >= g_fretSustainEndTime[i] || 
+                (songTime - g_fretSustainStartTime[i]) > 4.5f || 
+                (songTime < g_fretSustainStartTime[i] - 0.5f)) {
+
+                g_fretSustaining[i] = false;
+                g_fretSustainStartTime[i] = 0.0f;
+                g_fretSustainEndTime[i] = 0.0f;
+                g_fretVisualTimer[i] = 0;
+                if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
+                    old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret cleanly!
+                }
+                LogDebug("Sustain END: fret=%d released cleanly at songTime=%.2fs", i, songTime);
+            }
+        }
+
+        // B. Release tap timer for standard notes
         if (g_fretVisualTimer[i] > 0) {
             int t = --g_fretVisualTimer[i];
             if (t == 0 && !g_fretSustaining[i].load()) {
                 if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                     old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret cleanly!
-                }
-            }
-        } else if (g_fretSustaining[i].load()) {
-            g_fretSustainFrames[i]++;
-            // Safety cap: release if sustain exceeds 3 seconds (~180 frames)
-            if (g_fretSustainFrames[i] > 180) {
-                g_fretSustaining[i] = false;
-                g_fretSustainFrames[i] = 0;
-                if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
-                    old_Main_Frets_byc(mainFretsInstance, i, false);
                 }
             }
         }
@@ -1313,25 +920,7 @@ void *hack_thread(void *) {
     HOOK("0x20f3148", hook_MenuMus_Setlist_cno, old_MenuMus_Setlist_cno);
     LogDebug("Hook MenuMus_Setlist::cno (0x20f3148): %s", old_MenuMus_Setlist_cno != nullptr ? "SUCCESS" : "FAILED");
 
-    // 15. Resolve lx ObscuredInt helper functions
-    lx_op_Implicit_to_int = reinterpret_cast<int32_t (*)(void *)>(base + 0x210bc94);
-    lx_op_Implicit_from_int = reinterpret_cast<void *(*)(int32_t)>(base + 0x210d21c);
-
-    // 16. Hook Main_Special::bzk (0x20bae98) - Special Ability Activation
-    Main_Special_bzk = reinterpret_cast<void (*)(void *, bool)>(base + 0x20bae98);
-    HOOK("0x20bae98", hook_Main_Special_bzk, old_Main_Special_bzk);
-    LogDebug("Hook Main_Special::bzk (0x20bae98): %s", old_Main_Special_bzk != nullptr ? "SUCCESS" : "FAILED");
-
-    // 17. Hook Main_Special::bzl (0x20bb068) - Special Ability Deactivation
-    Main_Special_bzl = reinterpret_cast<void (*)(void *)>(base + 0x20bb068);
-    HOOK("0x20bb068", hook_Main_Special_bzl, old_Main_Special_bzl);
-    LogDebug("Hook Main_Special::bzl (0x20bb068): %s", old_Main_Special_bzl != nullptr ? "SUCCESS" : "FAILED");
-
-    // 18. Hook ed::bab (0x1c31de0) - Chart Loader & Instance Capture
-    HOOK("0x1c31de0", hook_ed_bab, old_ed_bab);
-    LogDebug("Hook ed::bab (0x1c31de0): %s", old_ed_bab != nullptr ? "SUCCESS" : "FAILED");
-
-    // 19. Hook Main_Notes::Add (0x20b8570) - Real-time Note & Star Power Chart Recorder
+    // 15. Hook Main_Notes::Add (0x20b8570) - Real-time Note Duration Recorder
     HOOK("0x20b8570", hook_Main_Notes_Add, old_Main_Notes_Add);
     LogDebug("Hook Main_Notes::Add (0x20b8570): %s", old_Main_Notes_Add != nullptr ? "SUCCESS" : "FAILED");
 
@@ -1339,7 +928,7 @@ void *hack_thread(void *) {
     ed_Count = reinterpret_cast<int32_t (*)(void *)>(base + 0x1c31f44);
     ed_bad = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1c31f14);
 
-    LogDebug("All Guitar Hero Real-Time, Auto Play, Smart Special & Song Unlock hooks installed successfully!");
+    LogDebug("All Guitar Hero Real-Time, Auto Play & Song Unlock hooks installed successfully!");
 
 #else 
     LogDebug("ARM32 architecture not supported for this 64-bit target");
@@ -1352,10 +941,9 @@ void *hack_thread(void *) {
 // JNI Method Implementations
 // =========================================================================
 
-// Returns [green, red, yellow, blue, orange, totalHits, totalMisses, totalCreated, totalAutoHits, autoPlay,
-//          specialActive, specialEnergy, currentCombo, currentScore, autoSpecialEnabled, totalSpecialActivations]
+// Returns [green, red, yellow, blue, orange, totalHits, totalMisses, totalCreated, totalAutoHits, autoPlay, currentCombo, currentScore]
 jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
-    jintArray result = env->NewIntArray(16);
+    jintArray result = env->NewIntArray(12);
     if (!result) return nullptr;
 
     int32_t totalHits = getNotesHit();
@@ -1363,7 +951,7 @@ jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
         g_totalAutoHits = totalHits;
     }
 
-    jint fill[16];
+    jint fill[12];
     fill[0] = g_greenHits.load();
     fill[1] = g_redHits.load();
     fill[2] = g_yellowHits.load();
@@ -1374,14 +962,10 @@ jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
     fill[7] = getNotesTotalCreated();
     fill[8] = g_totalAutoHits.load();
     fill[9] = g_autoPlay.load() ? 1 : 0;
-    fill[10] = g_isSpecialActive.load() ? 1 : 0;
-    fill[11] = g_specialEnergyLevel.load();
-    fill[12] = g_currentCombo.load();
-    fill[13] = g_currentScore.load();
-    fill[14] = g_autoSpecial.load() ? 1 : 0;
-    fill[15] = g_totalSpecialActivations.load();
+    fill[10] = g_currentCombo.load();
+    fill[11] = g_currentScore.load();
 
-    env->SetIntArrayRegion(result, 0, 16, fill);
+    env->SetIntArrayRegion(result, 0, 12, fill);
     return result;
 }
 
@@ -1391,7 +975,6 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     const char *features[] = {
             OBFUSCATE("Category_⚡ Automation"),
             OBFUSCATE("10_Toggle_Auto Play"),
-            OBFUSCATE("11_Toggle_Auto Special (Smart Path)"),
 
             OBFUSCATE("Category_🎵 Songs & Unlocks"),
             OBFUSCATE("20_Toggle_Unlock All Songs"),
@@ -1404,7 +987,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>⭐ Auto Special: Smart path 8x score otomatis tanpa clipping SP phrase.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1434,7 +1017,8 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
                 for (int i = 0; i < 5; i++) {
                     g_fretVisualTimer[i] = 0;
                     g_fretSustaining[i] = false;
-                    g_fretSustainFrames[i] = 0;
+                    g_fretSustainStartTime[i] = 0.0f;
+                    g_fretSustainEndTime[i] = 0.0f;
                     if (old_Main_Frets_byc != nullptr && mainFretsInstance != nullptr) {
                         old_Main_Frets_byc(mainFretsInstance, i, false);
                     }
@@ -1442,13 +1026,6 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             }
             LogDebug("Auto Play toggled: %d", boolean);
             Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Play: AKTIF") : OBFUSCATE("⚡ Auto Play: NONAKTIF"), ToastLength::LENGTH_SHORT);
-            break;
-
-        // Auto Special Ability (Smart Path)
-        case 11:
-            g_autoSpecial = boolean;
-            LogDebug("Auto Special toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("⭐ Auto Special (Smart Path): AKTIF") : OBFUSCATE("⭐ Auto Special: NONAKTIF"), ToastLength::LENGTH_SHORT);
             break;
 
         // Unlock All Songs Feature (OFF by default)
@@ -1493,45 +1070,25 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             int32_t blue = g_blueHits.load();
             int32_t orange = g_orangeHits.load();
             int32_t hit = getNotesHit();
-            int32_t perd = getNotesPerdidas();
-            int32_t err = getNotesErradas();
             int32_t miss = getNotesMiss();
             int32_t total = getNotesTotalCreated();
             int32_t autoTotal = g_totalAutoHits.load();
             int32_t combo = g_currentCombo.load();
-            int32_t spEnergy = g_specialEnergyLevel.load();
-            int32_t spActivations = g_totalSpecialActivations.load();
-            bool spActive = g_isSpecialActive.load();
 
-            size_t curStep = g_currentPathStep.load();
-            size_t totalSteps = 0;
-            int32_t nextTargetHit = -1;
-            int32_t nextReqEnergy = 0;
-            pthread_mutex_lock(&g_pathMutex);
-            totalSteps = g_activePathMilestones.size();
-            if (curStep < totalSteps) {
-                nextTargetHit = g_activePathMilestones[curStep].targetHit;
-                nextReqEnergy = g_activePathMilestones[curStep].requiredEnergy;
-            }
-            pthread_mutex_unlock(&g_pathMutex);
-
-            char statsMsg[700];
+            char statsMsg[512];
             snprintf(statsMsg, sizeof(statsMsg),
-                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n⭐ SP: %s | Energy: %d/4\n📋 Path Step: %zu/%zu | Target Hit: %d (Req: %d bars)\n⚡ Activations: %d | Total Notes: %d",
-                     green, red, yellow, blue, orange, hit, autoTotal, combo, miss,
-                     spActive ? "8x ACTIVE 🔥" : (g_autoSpecial.load() ? "READY (Deterministic Path)" : "OFF"),
-                     spEnergy, curStep, totalSteps, nextTargetHit, nextReqEnergy,
-                     spActivations, total);
+                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n📋 Total Notes: %d",
+                     green, red, yellow, blue, orange, hit, autoTotal, combo, miss, total);
 
-            LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, SPActive=%d, Miss=%d, Step=%zu/%zu",
-                     hit, autoTotal, combo, spActive ? 1 : 0, miss, curStep, totalSteps);
+            LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, Miss=%d",
+                     hit, autoTotal, combo, miss);
             Toast(env, obj, statsMsg, ToastLength::LENGTH_LONG);
             break;
         }
 
         case 3: // Button: Reset Note Counters
             resetAllNoteCounters();
-            Toast(env, obj, OBFUSCATE("Semua counter note, auto hit & special path di-reset ke 0!"), ToastLength::LENGTH_SHORT);
+            Toast(env, obj, OBFUSCATE("Semua counter note & auto hit di-reset ke 0!"), ToastLength::LENGTH_SHORT);
             break;
 
         case 4: // Button: Check Debug Log Path
