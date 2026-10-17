@@ -1422,6 +1422,32 @@ void hook_Main_Notes_bzc(void *instance, void *hm) {
     }
 }
 
+// Hook Main_Notes::bza (RVA: 0x20b992c)
+// Called when a sustain / rastro is dropped or released early
+void (*old_Main_Notes_bza)(void *instance, void *hm) = nullptr;
+void hook_Main_Notes_bza(void *instance, void *hm) {
+    if (g_autoPlay.load()) {
+        // Under Auto Play, do not allow sustain to be prematurely broken!
+        return;
+    }
+    if (old_Main_Notes_bza != nullptr) {
+        old_Main_Notes_bza(instance, hm);
+    }
+}
+
+// Hook Main_Special::bzq (RVA: 0x20b9840)
+// Called when a star phrase is failed on miss or error
+void (*old_Main_Special_bzq)(void *instance, void *hm) = nullptr;
+void hook_Main_Special_bzq(void *instance, void *hm) {
+    if (g_autoPlay.load()) {
+        // Under Auto Play, do not mark special phrases as failed!
+        return;
+    }
+    if (old_Main_Special_bzq != nullptr) {
+        old_Main_Special_bzq(instance, hm);
+    }
+}
+
 // 6. Hook Main_Frets::byc (RVA: 0x1f9cec8)
 // Animates and controls visual button press/release on screen (from commit e4947d)
 void hook_Main_Frets_byc(void *instance, int32_t fret, bool pressed) {
@@ -1477,11 +1503,11 @@ void hook_Main_Notes_bzd(void *instance, void *hm, float time) {
         if (transform != nullptr) {
             Vector3 pos = Transform_get_position(transform);
 
-            // In Guitar Flash (from commit e4947d):
+            // In Guitar Flash:
             // Center of the color circle is at Z ≈ -13.05f.
-            // When pos.z <= -12.7f, the note is visually inside the color circle!
-            // Hits at Z ∈ [-12.7f, -15.5f] look completely natural, legit, and centered.
-            if (pos.z <= -12.7f && pos.z >= -15.5f) {
+            // When pos.z <= -12.7f, note has reached or passed into the color circle.
+            // Eliminate lower bound so fast-moving notes in solo shred sections are never dropped!
+            if (pos.z <= -12.7f) {
                 // Execute Perfect hit directly on note
                 hook_Main_Notes_byy(instance, hm, time);
 
@@ -1678,18 +1704,14 @@ void hook_Main_Special_bzn(void *instance, void *hm) {
                 }
             }
         }
-    }
 
-    if (old_Main_Special_bzn != nullptr) {
-        old_Main_Special_bzn(instance, hm);
-    }
+        if (old_Main_Special_bzn != nullptr) {
+            old_Main_Special_bzn(instance, hm);
+        }
 
-    if (g_instantFullSpecialEnergy.load() && instance != nullptr && hm != nullptr) {
-        void *sp = *(void **)((uintptr_t)hm + 0x30);
         if (sp != nullptr && (uintptr_t)sp > 0x10000) {
             bool starNote = *(bool *)((uintptr_t)sp + 0x10);
             if (starNote) {
-                // Guarantee 100% full energy (4 bars) and activate button
                 if (lx_op_Implicit_from_int != nullptr) {
                     *(void **)((uintptr_t)instance + 0x40) = lx_op_Implicit_from_int(4, nullptr);
                 }
@@ -1705,6 +1727,37 @@ void hook_Main_Special_bzn(void *instance, void *hm) {
                 LogDebug("Instant Full Special Energy: Star note hit! Energy filled to 4/4 (100%%) instantly.");
             }
         }
+        return;
+    }
+
+    if (g_autoPlay.load() && instance != nullptr && hm != nullptr) {
+        void *sp = *(void **)((uintptr_t)hm + 0x30);
+        if (sp != nullptr && (uintptr_t)sp > 0x10000) {
+            bool starNote = *(bool *)((uintptr_t)sp + 0x10);
+            if (starNote) {
+                // CRITICAL FIX: In native code, if Special Power is active (offset 0x21),
+                // it immediately discards star notes and marks the phrase as failed (0x3c)!
+                // Temporarily unmask active so phrase progress is ALWAYS registered (guarantees 30/30 phrases!).
+                bool wasActive = *(bool *)((uintptr_t)instance + 0x21);
+                if (wasActive) {
+                    *(bool *)((uintptr_t)instance + 0x21) = false;
+                }
+                *(int32_t *)((uintptr_t)instance + 0x3c) = -1; // Clear failedSequence
+
+                if (old_Main_Special_bzn != nullptr) {
+                    old_Main_Special_bzn(instance, hm);
+                }
+
+                if (wasActive) {
+                    *(bool *)((uintptr_t)instance + 0x21) = true;
+                }
+                return;
+            }
+        }
+    }
+
+    if (old_Main_Special_bzn != nullptr) {
+        old_Main_Special_bzn(instance, hm);
     }
 }
 
@@ -1886,9 +1939,17 @@ void *hack_thread(void *) {
     HOOK("0x20b8570", hook_Main_Notes_Add, old_Main_Notes_Add);
     LogDebug("Hook Main_Notes::Add (0x20b8570): %s", old_Main_Notes_Add != nullptr ? "SUCCESS" : "FAILED");
 
-    // 16. Hook Main_Special::bzn (0x20b92c0) - Instant Full Special Energy on Star Note Hit
+    // 16. Hook Main_Special::bzn (0x20b92c0) - Instant Full Special Energy & Unmasked Phrase Progress
     HOOK("0x20b92c0", hook_Main_Special_bzn, old_Main_Special_bzn);
     LogDebug("Hook Main_Special::bzn (0x20b92c0): %s", old_Main_Special_bzn != nullptr ? "SUCCESS" : "FAILED");
+
+    // 17. Hook Main_Special::bzq (0x20b9840) - Star Phrase Failure Suppressor
+    HOOK("0x20b9840", hook_Main_Special_bzq, old_Main_Special_bzq);
+    LogDebug("Hook Main_Special::bzq (0x20b9840): %s", old_Main_Special_bzq != nullptr ? "SUCCESS" : "FAILED");
+
+    // 18. Hook Main_Notes::bza (0x20b992c) - Sustain Drop Suppressor
+    HOOK("0x20b992c", hook_Main_Notes_bza, old_Main_Notes_bza);
+    LogDebug("Hook Main_Notes::bza (0x20b992c): %s", old_Main_Notes_bza != nullptr ? "SUCCESS" : "FAILED");
 
     // Resolve Unity GameObject, ObscuredInt & Special Power activation methods
     GameObject_SetActive = reinterpret_cast<void (*)(void *, bool, void *)>(base + 0x3caddcc);
