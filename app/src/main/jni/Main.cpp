@@ -140,6 +140,8 @@ static std::atomic<bool> g_instantFullSpecialEnergy{false};
 static void (*GameObject_SetActive)(void *gameObject, bool value, void *methodInfo) = nullptr;
 static void *(*lx_op_Implicit_from_int)(int32_t value, void *methodInfo) = nullptr;
 static int32_t (*lx_op_Implicit_to_int)(void *obscuredInt, void *methodInfo) = nullptr;
+static void (*Main_Special_bzk)(void *instance, bool a) = nullptr; // RVA: 0x20bae98 - Special Power native activation
+static std::atomic<bool> g_autoUseSpecial{false};
 
 // Helper: Inspects active notes in Main_Notes::eoq directly from the engine
 // Returns true if a note on this fret is hit and actively sustaining
@@ -310,8 +312,7 @@ static int64_t g_bestPotentialScore = 0;
 static int64_t g_baseFcScore = 0;
 static std::string g_pathSummary = "-";
 static std::vector<SpPathMilestone> g_activePathMilestones;
-
-
+static std::atomic<size_t> g_currentMilestoneIndex{0};
 
 static void resetAllNoteCounters() {
     g_greenHits = 0;
@@ -339,6 +340,7 @@ static void resetAllNoteCounters() {
     g_totalAutoHits = 0;
     g_currentCombo = 0;
     g_currentScore = 0;
+    g_currentMilestoneIndex = 0;
 
     if (mainNotesInstance != nullptr) {
         *(int32_t *)((uintptr_t)mainNotesInstance + 0x64) = 0; // acertadas
@@ -510,11 +512,11 @@ static void AnalyzeChartAndCalculateMetrics() {
             spNotesCount++;
             if (!inPhrase) {
                 inPhrase = true;
-                curPhrase.startNote = notes[i].num;
+                curPhrase.startNote = (int32_t)(i + 1); // 1-indexed combo hit
                 curPhrase.startTime = notes[i].time;
                 curPhrase.count = 0;
             }
-            curPhrase.endNote = notes[i].num;
+            curPhrase.endNote = (int32_t)(i + 1); // 1-indexed combo hit
             curPhrase.endTime = notes[i].time + notes[i].duration;
             curPhrase.count++;
         } else {
@@ -529,50 +531,9 @@ static void AnalyzeChartAndCalculateMetrics() {
     }
     int32_t totalPhrases = (int32_t)phrases.size();
 
-    // 6. Build Deterministic Optimal Path
-    bool isDragonforce = false;
-    if (title.find("Dragonforce") != std::string::npos ||
-        title.find("DragonForce") != std::string::npos ||
-        title.find("Fire and Flames") != std::string::npos ||
-        title.find("Through the Fire") != std::string::npos ||
-        notes.size() >= 2500) {
-        isDragonforce = true;
-    }
-
+    // 6. Build Deterministic Optimal Path (100% Dynamic for All Songs)
     std::vector<SpPathMilestone> milestones;
-    if (isDragonforce) {
-        // Community-verified top competitive path for DragonForce - Through the Fire and Flames (Hard / Level 6):
-        // Rute: 2 2 2 2 2 2 2 3 3 2 2 2 4
-        // Titik Trigger Kombo: 128 - 294 - 456 - 589 - 825 - 969 - 1095 - 1366 - 1823 - 2018 - 2152 - 2259 - 2607
-        struct TargetTrigger {
-            int32_t combo;
-            int32_t energy;
-        };
-        static const std::vector<TargetTrigger> TTFAF_COMPETITIVE_TRIGGERS = {
-            {128, 2},
-            {294, 2},
-            {456, 2},
-            {589, 2},
-            {825, 2},
-            {969, 2},
-            {1095, 2},
-            {1366, 3},
-            {1823, 3},
-            {2018, 2},
-            {2152, 2},
-            {2259, 2},
-            {2607, 4}
-        };
-
-        for (const auto &trig : TTFAF_COMPETITIVE_TRIGGERS) {
-            if (trig.combo <= (int32_t)notes.size()) {
-                int32_t hitIdx = trig.combo - 1; // 0-indexed note
-                float startT = notes[hitIdx].time;
-                float dur = (float)trig.energy * 3.75f;
-                milestones.push_back({trig.combo, trig.energy, startT, dur});
-            }
-        }
-    } else if (!phrases.empty()) {
+    if (!phrases.empty()) {
         int32_t simEnergy = 0;
         float simActivationEndTime = -1.0f;
 
@@ -596,8 +557,8 @@ static void AnalyzeChartAndCalculateMetrics() {
                 if (simEnergy >= 4) {
                     shouldSchedule = true; // Bar full (4/4), schedule activation to prevent waste
                 } else if (!hasNextPhrase) {
-                    shouldSchedule = true; // Outro, no more phrases ahead
-                } else if (proposedEndTime <= nextPhraseStart + 0.15f) {
+                    shouldSchedule = true; // Outro / last phrase in song
+                } else if (proposedEndTime <= nextPhraseStart + 0.20f) {
                     shouldSchedule = true; // Clean window without overlapping next phrase
                 }
 
@@ -613,7 +574,7 @@ static void AnalyzeChartAndCalculateMetrics() {
 
         // Outro check: if energy remained at end of song
         if (simEnergy >= 2 && !notes.empty()) {
-            int32_t outroHit = notes.back().num - 25;
+            int32_t outroHit = (int32_t)notes.size() - 25;
             if (outroHit < 30) outroHit = 30;
             float dur = (float)simEnergy * 3.75f;
             float startT = notes.back().time - dur;
@@ -627,7 +588,7 @@ static void AnalyzeChartAndCalculateMetrics() {
         }
     }
 
-    // 7. Format Path Summary string (e.g. "2-2-2-2-2-2-2-3-3-2-2-2-4")
+    // 7. Format Path Summary string (e.g. "3-2-3-2-3-3-2-3-2")
     std::string pathSummary = "";
     for (size_t i = 0; i < milestones.size(); i++) {
         if (i > 0) pathSummary += "-";
@@ -659,9 +620,7 @@ static void AnalyzeChartAndCalculateMetrics() {
             mult = 2.0f;
         }
 
-        // Sustain points:
-        // ~2.5 pts per second per multiplier in Guitar Flash
-        // At 4x multiplier: 10 pts/sec
+        // Sustain points
         int64_t sustainBase = 0;
         if (notes[i].duration > 0.1f) {
             sustainBase = (int64_t)(notes[i].duration * 2.5f * mult);
@@ -671,16 +630,16 @@ static void AnalyzeChartAndCalculateMetrics() {
         // Check if note falls within an active SP window
         bool isSpActive = false;
         for (const auto &m : milestones) {
-            if (notes[i].time >= (m.startTime - 0.05f) && notes[i].time <= (m.startTime + m.duration + 0.05f)) {
+            if (notes[i].time > m.startTime && notes[i].time <= (m.startTime + m.duration)) {
                 isSpActive = true;
                 break;
             }
         }
 
         // With Special Power active:
-        // Multiplier doubles: 10, 20, 30, 40 pts
+        // Multiplier doubles: 10, 20, 30, 40 pts and sustain points double
         int64_t noteSp = isSpActive ? (noteBase * 2) : noteBase;
-        int64_t sustainSp = isSpActive ? (int64_t)(notes[i].duration * 2.5f * mult * 2.0f) : sustainBase;
+        int64_t sustainSp = isSpActive ? (sustainBase * 2) : sustainBase;
         bestScore += noteSp + sustainSp;
 
         simCombo++;
@@ -701,6 +660,15 @@ static void AnalyzeChartAndCalculateMetrics() {
     g_baseFcScore = baseScore;
     g_pathSummary = pathSummary;
     g_activePathMilestones = milestones;
+
+    // Sync current milestone index with current hits
+    int32_t curHits = getNotesHit();
+    size_t sIdx = 0;
+    while (sIdx < milestones.size() && curHits >= milestones[sIdx].targetHit) {
+        sIdx++;
+    }
+    g_currentMilestoneIndex = sIdx;
+
     pthread_mutex_unlock(&g_chartAnalysisMutex);
 
     LogDebug("⭐ [ChartAnalysis] Extracted '%s' | Dur: %s (%.1fs) | Notes: %d | SP Notes: %d (%d Frase) | Best Score: %lld (Base: %lld) | Path: %s (%zu steps)",
@@ -766,6 +734,67 @@ void hook_Main_Scorer_cdc(void *instance, int32_t a, int32_t b) {
     }
 }
 
+// Automatic Special Power Trigger based on Dynamic Optimal Route
+static void CheckAndTriggerAutoSpecial() {
+    if (!g_autoUseSpecial.load() && !g_autoPlay.load()) {
+        return;
+    }
+    if (mainSpecialInstance == nullptr || (uintptr_t)mainSpecialInstance < 0x10000) {
+        return;
+    }
+    if (Main_Special_bzk == nullptr) {
+        return;
+    }
+
+    // Check if Special Power is already active (active: bool at offset 0x21)
+    bool isSpActive = *(bool *)((uintptr_t)mainSpecialInstance + 0x21);
+    if (isSpActive) {
+        return;
+    }
+
+    // Check timeBlocked at offset 0x24
+    float timeBlocked = *(float *)((uintptr_t)mainSpecialInstance + 0x24);
+    if (timeBlocked > 0.0f) {
+        return;
+    }
+
+    // Check current energy bars (epe: lx/ObscuredInt at offset 0x40)
+    int32_t currentEnergy = 0;
+    if (lx_op_Implicit_to_int != nullptr) {
+        void *epe = *(void **)((uintptr_t)mainSpecialInstance + 0x40);
+        if (epe != nullptr) {
+            currentEnergy = lx_op_Implicit_to_int(epe, nullptr);
+        }
+    }
+    if (currentEnergy < 2) {
+        return; // Minimum 2 bars required to activate
+    }
+
+    int32_t currentHits = getNotesHit();
+
+    pthread_mutex_lock(&g_chartAnalysisMutex);
+    size_t idx = g_currentMilestoneIndex.load();
+    // Catch up index if hits have far exceeded older milestone
+    while (idx < g_activePathMilestones.size() && currentHits > g_activePathMilestones[idx].targetHit + 25) {
+        idx++;
+    }
+    g_currentMilestoneIndex = idx;
+
+    if (idx < g_activePathMilestones.size()) {
+        const auto &m = g_activePathMilestones[idx];
+        if (currentHits >= m.targetHit && currentEnergy >= m.requiredEnergy) {
+            g_currentMilestoneIndex = idx + 1;
+            pthread_mutex_unlock(&g_chartAnalysisMutex);
+
+            LogDebug("⚡ [AutoSpecial] Triggering Special! Step %zu/%zu at Hit #%d (Target: %d, Energy: %d/%d)",
+                     idx + 1, g_activePathMilestones.size(), currentHits, m.targetHit, currentEnergy, m.requiredEnergy);
+            Main_Special_bzk(mainSpecialInstance, false);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&g_chartAnalysisMutex);
+}
+
 // 2. Hook Main_Notes::byy (RVA: 0x20b8fec)
 // Called whenever a note is successfully hit
 void (*old_Main_Notes_byy)(void *instance, void *hm, float b) = nullptr;
@@ -824,6 +853,9 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
     if (old_Main_Notes_byy != nullptr) {
         old_Main_Notes_byy(instance, hm, b);
     }
+
+    // Auto Use Special check right upon hitting milestone notes
+    CheckAndTriggerAutoSpecial();
 
     LogHitThrottled(fret, g_greenHits.load(), g_redHits.load(), g_yellowHits.load(),
                     g_blueHits.load(), g_orangeHits.load(), getNotesHit());
@@ -933,6 +965,7 @@ void hook_Main_Notes_byv(void *instance) {
         }
     }
     g_totalAutoHits = 0;
+    g_currentMilestoneIndex = 0;
 
     pthread_mutex_lock(&g_chartNotesMutex);
     g_cachedChartNotes.clear();
@@ -1178,6 +1211,9 @@ void hook_Main_Update(void *instance) {
             }
         }
     }
+
+    // Auto Use Special periodic frame check
+    CheckAndTriggerAutoSpecial();
 }
 
 // 10. Hook Main_Sounds::cfe (RVA: 0x20e267c)
@@ -1433,14 +1469,16 @@ void *hack_thread(void *) {
     HOOK("0x20b92c0", hook_Main_Special_bzn, old_Main_Special_bzn);
     LogDebug("Hook Main_Special::bzn (0x20b92c0): %s", old_Main_Special_bzn != nullptr ? "SUCCESS" : "FAILED");
 
-    // Resolve Unity GameObject & ObscuredInt methods for Special Energy
+    // Resolve Unity GameObject, ObscuredInt & Special Power activation methods
     GameObject_SetActive = reinterpret_cast<void (*)(void *, bool, void *)>(base + 0x3caddcc);
     lx_op_Implicit_from_int = reinterpret_cast<void *(*)(int32_t, void *)>(base + 0x210d21c);
     lx_op_Implicit_to_int = reinterpret_cast<int32_t (*)(void *, void *)>(base + 0x210bc94);
-    LogDebug("Resolve Special Energy methods: SetActive=%s, from_int=%s, to_int=%s",
+    Main_Special_bzk = reinterpret_cast<void (*)(void *, bool)>(base + 0x20bae98);
+    LogDebug("Resolve Special Energy methods: SetActive=%s, from_int=%s, to_int=%s, bzk=%s",
              GameObject_SetActive != nullptr ? "OK" : "FAIL",
              lx_op_Implicit_from_int != nullptr ? "OK" : "FAIL",
-             lx_op_Implicit_to_int != nullptr ? "OK" : "FAIL");
+             lx_op_Implicit_to_int != nullptr ? "OK" : "FAIL",
+             Main_Special_bzk != nullptr ? "OK" : "FAIL");
 
     // Hook ed::bab for song detection
     HOOK("0x1c31de0", hook_ed_bab, old_ed_bab);
@@ -1556,6 +1594,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     const char *features[] = {
             OBFUSCATE("Category_⚡ Automation"),
             OBFUSCATE("10_Toggle_Auto Play"),
+            OBFUSCATE("11_Toggle_Auto Activate Special (Optimal Route)"),
 
             OBFUSCATE("Category_⭐ Special & Multiplier"),
             OBFUSCATE("12_Toggle_Instant Full Special Energy"),
@@ -1571,7 +1610,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>⭐ Instant Special: Energi langsung 100% saat note bintang kena.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.<br>📊 Chart HUD: Info lagu, note special, rute optimal, & skor maks.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>⭐ Auto Special: Otomatis aktivasi SP di rute terbaik.<br>⚡ Instant Special: Energi langsung 100% saat note bintang kena.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.<br>📊 Chart HUD: Info lagu, note special, rute optimal, & skor maks.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1609,6 +1648,13 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             }
             LogDebug("Auto Play toggled: %d", boolean);
             Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Play: AKTIF") : OBFUSCATE("⚡ Auto Play: NONAKTIF"), ToastLength::LENGTH_SHORT);
+            break;
+
+        // Auto Activate Special (Optimal Route) Feature (OFF by default)
+        case 11:
+            g_autoUseSpecial = boolean;
+            LogDebug("Auto Activate Special toggled: %d", boolean);
+            Toast(env, obj, boolean ? OBFUSCATE("⭐ Auto Activate Special: AKTIF") : OBFUSCATE("⭐ Auto Activate Special: NONAKTIF"), ToastLength::LENGTH_SHORT);
             break;
 
         // Instant Full Special Energy Feature (OFF by default)
