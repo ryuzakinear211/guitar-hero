@@ -1,5 +1,7 @@
 #include <list>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 #include <string.h>
 #include <pthread.h>
 #include <thread>
@@ -531,55 +533,169 @@ static void AnalyzeChartAndCalculateMetrics() {
     }
     int32_t totalPhrases = (int32_t)phrases.size();
 
-    // 6. Build Deterministic Optimal Path (100% Dynamic for All Songs)
+    // 6. Build Deterministic Optimal Path via Dynamic Programming (100% Dynamic Global Score Optimizer)
     std::vector<SpPathMilestone> milestones;
     if (!phrases.empty()) {
-        int32_t simEnergy = 0;
-        float simActivationEndTime = -1.0f;
+        int32_t P = (int32_t)phrases.size();
+        int32_t numNotes = (int32_t)notes.size();
 
-        for (size_t p = 0; p < phrases.size(); p++) {
-            const auto &ph = phrases[p];
-            if (ph.startTime < simActivationEndTime) {
-                continue; // Cannot collect phrase while previous SP is still active
+        // Precompute note score prefix sums for fast O(1) interval bonus calculation
+        // Each note at 4x combo gives 20 pts base bonus + sustain bonus under Special Power
+        std::vector<int64_t> prefixBonus(numNotes + 1, 0);
+        int32_t simC = 0;
+        for (int32_t i = 0; i < numNotes; i++) {
+            int64_t nBase = 5;
+            float mult = 1.0f;
+            if (simC >= 30) { nBase = 20; mult = 4.0f; }
+            else if (simC >= 20) { nBase = 15; mult = 3.0f; }
+            else if (simC >= 10) { nBase = 10; mult = 2.0f; }
+
+            int64_t sBase = 0;
+            if (notes[i].duration > 0.1f) {
+                sBase = (int64_t)(notes[i].duration * 2.5f * mult);
             }
+            prefixBonus[i + 1] = prefixBonus[i] + (nBase + sBase);
+            simC++;
+        }
 
-            if (simEnergy < 4) {
-                simEnergy++;
+        // Helper lambda to calculate bonus points gained in window (startT, startT + dur]
+        auto getWindowBonus = [&](float startT, float dur) -> int64_t {
+            float endT = startT + dur;
+            // Binary search for first note with time > startT
+            int32_t left = 0, right = numNotes;
+            while (left < right) {
+                int32_t mid = left + (right - left) / 2;
+                if (notes[mid].time <= startT) {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
             }
+            int32_t startIdx = left;
 
-            if (simEnergy >= 2) {
-                bool hasNextPhrase = (p + 1 < phrases.size());
-                float nextPhraseStart = hasNextPhrase ? phrases[p + 1].startTime : 999999.0f;
-                float dur = (float)simEnergy * 3.75f;
-                float proposedEndTime = ph.endTime + dur;
+            // Binary search for first note with time > endT
+            left = startIdx; right = numNotes;
+            while (left < right) {
+                int32_t mid = left + (right - left) / 2;
+                if (notes[mid].time <= endT) {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            }
+            int32_t endIdx = left;
 
-                bool shouldSchedule = false;
-                if (simEnergy >= 4) {
-                    shouldSchedule = true; // Bar full (4/4), schedule activation to prevent waste
-                } else if (!hasNextPhrase) {
-                    shouldSchedule = true; // Outro / last phrase in song
-                } else if (proposedEndTime <= nextPhraseStart + 0.20f) {
-                    shouldSchedule = true; // Clean window without overlapping next phrase
+            return prefixBonus[endIdx] - prefixBonus[startIdx];
+        };
+
+        // DP Table: (P + 1) rows, 5 columns (energy 0..4)
+        // dp[p][e]: maximum future score from phrase p onwards given incoming energy e
+        // action[p][e]: 0 = HOLD, 2, 3, 4 = ACTIVATE with that energy
+        std::vector<std::vector<int64_t>> dp(P + 1, std::vector<int64_t>(5, -1));
+        std::vector<std::vector<int32_t>> action(P + 1, std::vector<int32_t>(5, 0));
+
+        // Base case: after phrase P (end of song)
+        for (int32_t e = 0; e <= 4; e++) {
+            dp[P][e] = 0;
+            action[P][e] = 0;
+        }
+
+        // Bottom-up DP from last phrase (P - 1) backwards to 0
+        for (int32_t p = P - 1; p >= 0; p--) {
+            for (int32_t e = 0; e <= 3; e++) {
+                int32_t eCurr = std::min(4, e + 1);
+                int64_t bestScore = -1;
+                int32_t bestAct = 0;
+
+                // Option 1: HOLD (if not last phrase and eCurr < 4)
+                if (p < P - 1 && eCurr < 4) {
+                    if (dp[p + 1][eCurr] >= 0) {
+                        bestScore = dp[p + 1][eCurr];
+                        bestAct = 0; // HOLD
+                    }
                 }
 
-                if (shouldSchedule) {
-                    int32_t targetHit = ph.endNote;
-                    if (targetHit < 30) targetHit = 30; // Wait for 4x base multiplier
-                    milestones.push_back({targetHit, simEnergy, ph.endTime, dur});
-                    simActivationEndTime = ph.endTime + dur;
-                    simEnergy = 0;
+                // Option 2: ACTIVATE with eCurr (if eCurr >= 2)
+                if (eCurr >= 2) {
+                    float dur = (float)eCurr * 3.75f;
+                    float startT = phrases[p].endTime;
+                    bool canActivate = false;
+
+                    if (p == P - 1) {
+                        canActivate = true; // Last phrase of song
+                    } else if (startT + dur <= phrases[p + 1].startTime + 0.20f) {
+                        canActivate = true;
+                    }
+
+                    if (canActivate) {
+                        int64_t wBonus = getWindowBonus(startT, dur);
+                        if (dp[p + 1][0] >= 0) {
+                            int64_t tot = wBonus + dp[p + 1][0];
+                            if (tot > bestScore) {
+                                bestScore = tot;
+                                bestAct = eCurr; // ACTIVATE with eCurr
+                            }
+                        }
+                    }
                 }
+
+                // Fallback: If full eCurr didn't fit gap, test smaller energy (testE = 3, 2)
+                if (bestScore < 0 && eCurr >= 2) {
+                    for (int32_t testE = eCurr - 1; testE >= 2; testE--) {
+                        float dur = (float)testE * 3.75f;
+                        float startT = phrases[p].endTime;
+                        if (p == P - 1 || startT + dur <= phrases[p + 1].startTime + 0.20f) {
+                            int64_t wBonus = getWindowBonus(startT, dur);
+                            if (dp[p + 1][0] >= 0) {
+                                int64_t tot = wBonus + dp[p + 1][0];
+                                if (tot > bestScore) {
+                                    bestScore = tot;
+                                    bestAct = testE;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Safety fallback: ensure a valid transition exists
+                if (bestScore < 0) {
+                    if (p < P - 1) {
+                        bestScore = (dp[p + 1][eCurr] >= 0) ? dp[p + 1][eCurr] : 0;
+                        bestAct = 0;
+                    } else {
+                        bestScore = 0;
+                        bestAct = (eCurr >= 2) ? eCurr : 0;
+                    }
+                }
+
+                dp[p][e] = bestScore;
+                action[p][e] = bestAct;
             }
         }
 
-        // Outro check: if energy remained at end of song
-        if (simEnergy >= 2 && !notes.empty()) {
-            int32_t outroHit = (int32_t)notes.size() - 25;
+        // Reconstruct the optimal path starting from phrase 0 with energy 0
+        int32_t curE = 0;
+        for (int32_t p = 0; p < P; p++) {
+            int32_t act = action[p][curE];
+            int32_t eCurr = std::min(4, curE + 1);
+
+            if (act >= 2) {
+                int32_t targetHit = phrases[p].endNote;
+                if (targetHit < 30) targetHit = 30; // Wait for 4x base multiplier
+                float dur = (float)act * 3.75f;
+                milestones.push_back({ targetHit, act, phrases[p].endTime, dur });
+                curE = 0; // Reset energy after activation
+            } else {
+                curE = eCurr;
+            }
+        }
+
+        // Outro check: if energy remained after the last phrase (and was not yet scheduled)
+        if (curE >= 2 && !notes.empty() && (milestones.empty() || milestones.back().targetHit != phrases.back().endNote)) {
+            int32_t outroHit = phrases.back().endNote;
             if (outroHit < 30) outroHit = 30;
-            float dur = (float)simEnergy * 3.75f;
-            float startT = notes.back().time - dur;
-            if (startT < 0.0f) startT = 0.0f;
-            milestones.push_back({outroHit, simEnergy, startT, dur});
+            float dur = (float)curE * 3.75f;
+            milestones.push_back({ outroHit, curE, phrases.back().endTime, dur });
         }
     } else {
         // Fallback for custom charts without star notes
@@ -588,7 +704,7 @@ static void AnalyzeChartAndCalculateMetrics() {
         }
     }
 
-    // 7. Format Path Summary string (e.g. "3-2-3-2-3-3-2-3-2")
+    // 7. Format Path Summary string (e.g. "2-2-2-2-2-2-2-3-3-2-2-2-4")
     std::string pathSummary = "";
     for (size_t i = 0; i < milestones.size(); i++) {
         if (i > 0) pathSummary += "-";
