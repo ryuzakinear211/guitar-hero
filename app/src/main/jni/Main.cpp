@@ -592,11 +592,99 @@ static void AnalyzeChartAndCalculateMetrics() {
 
     // 6. Build Deterministic Optimal Path (Competitive Presets + Dynamic Global Score Optimizer)
     std::vector<SpPathMilestone> milestones;
-    if (isDragonforce) {
-        // Community-verified top competitive path for DragonForce - Through the Fire and Flames (Hard / Level 6):
+    int32_t numNotes = (int32_t)notes.size();
+
+    // Precompute note score prefix sums for fast O(1) interval bonus calculation
+    std::vector<int64_t> prefixBonus(numNotes + 1, 0);
+    int32_t simC = 0;
+    for (int32_t i = 0; i < numNotes; i++) {
+        int64_t nBase = 5;
+        float mult = 1.0f;
+        if (simC >= 30) { nBase = 20; mult = 4.0f; }
+        else if (simC >= 20) { nBase = 15; mult = 3.0f; }
+        else if (simC >= 10) { nBase = 10; mult = 2.0f; }
+
+        int64_t sBase = 0;
+        if (notes[i].duration > 0.1f) {
+            sBase = (int64_t)(notes[i].duration * 2.5f * mult);
+        }
+        prefixBonus[i + 1] = prefixBonus[i] + (nBase + sBase);
+        simC++;
+    }
+
+    // Helper lambda to calculate bonus points gained in inclusive window [startT, startT + dur]
+    auto getWindowBonus = [&](float startT, float dur) -> int64_t {
+        float endT = startT + dur;
+        int32_t left = 0, right = numNotes;
+        while (left < right) {
+            int32_t mid = left + (right - left) / 2;
+            if (notes[mid].time < startT - 0.01f) {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        int32_t startIdx = left;
+
+        left = startIdx; right = numNotes;
+        while (left < right) {
+            int32_t mid = left + (right - left) / 2;
+            if (notes[mid].time <= endT + 0.01f) {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        int32_t endIdx = left;
+
+        if (startIdx >= endIdx) return 0;
+        return prefixBonus[endIdx] - prefixBonus[startIdx];
+    };
+
+    if (isDragonforce && totalPhrases >= 25) {
+        // Community-verified top competitive 13-step path for DragonForce - Through the Fire and Flames (Hard / Level 6):
         // Rute: 2 2 2 2 2 2 2 3 3 2 2 2 4 (13 steps)
-        // Hit triggers: 128 - 294 - 456 - 589 - 825 - 969 - 1095 - 1366 - 1823 - 2018 - 2152 - 2259 - 2607
-        // Generates ~75,040+ points with 100% full combo synergy!
+        // Dynamically anchored to the EXACT phrase completions so energy is 100% full and ready!
+        // Searches local window [readyNote, readyNote + 35] for the absolute PEAK note density!
+        static const int32_t TTFAF_STEP_END_PHRASES[13] = {1, 3, 5, 7, 9, 11, 13, 16, 19, 21, 23, 25, 29};
+        static const int32_t TTFAF_STEP_ENERGY[13] = {2, 2, 2, 2, 2, 2, 2, 3, 3, 2, 2, 2, 4};
+
+        for (int32_t s = 0; s < 13; s++) {
+            int32_t pIdx = TTFAF_STEP_END_PHRASES[s];
+            int32_t energy = TTFAF_STEP_ENERGY[s];
+            float dur = (float)energy * 3.75f;
+            int32_t readyNote = (pIdx < (int32_t)phrases.size()) ? phrases[pIdx].endNote : 0;
+            if (readyNote <= 0) readyNote = 30;
+
+            int32_t k_start = readyNote - 1;
+            if (k_start < 0) k_start = 0;
+            if (k_start >= numNotes) k_start = numNotes - 1;
+
+            int32_t k_search_end = k_start + 35;
+            if (s + 1 < 13 && TTFAF_STEP_END_PHRASES[s + 1] < (int32_t)phrases.size()) {
+                int32_t nextStart = phrases[TTFAF_STEP_END_PHRASES[s + 1]].startNote - 1;
+                if (nextStart > k_start && nextStart < k_search_end) {
+                    k_search_end = nextStart;
+                }
+            }
+            if (k_search_end >= numNotes) k_search_end = numNotes - 1;
+
+            int32_t bestK = k_start;
+            int64_t bestBonus = -1;
+            for (int32_t k = k_start; k <= k_search_end; k++) {
+                int64_t b = getWindowBonus(notes[k].time, dur);
+                if (b > bestBonus) {
+                    bestBonus = b;
+                    bestK = k;
+                }
+            }
+
+            int32_t triggerCombo = bestK + 1;
+            float startT = notes[bestK].time;
+            milestones.push_back({triggerCombo, energy, startT, dur});
+        }
+    } else if (isDragonforce) {
+        // Fallback preset if chart is still streaming
         struct TargetTrigger {
             int32_t combo;
             int32_t energy;
@@ -627,54 +715,6 @@ static void AnalyzeChartAndCalculateMetrics() {
         }
     } else if (!phrases.empty()) {
         int32_t P = (int32_t)phrases.size();
-        int32_t numNotes = (int32_t)notes.size();
-
-        // Precompute note score prefix sums for fast O(1) interval bonus calculation
-        std::vector<int64_t> prefixBonus(numNotes + 1, 0);
-        int32_t simC = 0;
-        for (int32_t i = 0; i < numNotes; i++) {
-            int64_t nBase = 5;
-            float mult = 1.0f;
-            if (simC >= 30) { nBase = 20; mult = 4.0f; }
-            else if (simC >= 20) { nBase = 15; mult = 3.0f; }
-            else if (simC >= 10) { nBase = 10; mult = 2.0f; }
-
-            int64_t sBase = 0;
-            if (notes[i].duration > 0.1f) {
-                sBase = (int64_t)(notes[i].duration * 2.5f * mult);
-            }
-            prefixBonus[i + 1] = prefixBonus[i] + (nBase + sBase);
-            simC++;
-        }
-
-        // Helper lambda to calculate bonus points gained in inclusive window [startT, startT + dur]
-        auto getWindowBonus = [&](float startT, float dur) -> int64_t {
-            float endT = startT + dur;
-            int32_t left = 0, right = numNotes;
-            while (left < right) {
-                int32_t mid = left + (right - left) / 2;
-                if (notes[mid].time < startT - 0.01f) {
-                    left = mid + 1;
-                } else {
-                    right = mid;
-                }
-            }
-            int32_t startIdx = left;
-
-            left = startIdx; right = numNotes;
-            while (left < right) {
-                int32_t mid = left + (right - left) / 2;
-                if (notes[mid].time <= endT + 0.01f) {
-                    left = mid + 1;
-                } else {
-                    right = mid;
-                }
-            }
-            int32_t endIdx = left;
-
-            if (startIdx >= endIdx) return 0;
-            return prefixBonus[endIdx] - prefixBonus[startIdx];
-        };
 
         // DP Table: (P + 1) rows, 5 columns (energy 0..4)
         std::vector<std::vector<int64_t>> dp(P + 1, std::vector<int64_t>(5, -1));
@@ -703,55 +743,14 @@ static void AnalyzeChartAndCalculateMetrics() {
                     }
                 }
 
-                // Option 2: ACTIVATE with eCurr (if eCurr >= 2)
+                // Option 2: ACTIVATE with useE (from eCurr down to 2)
                 if (eCurr >= 2) {
-                    float dur = (float)eCurr * 3.75f;
-                    int32_t k_start = phrases[p].endNote - 1;
-                    if (k_start < 0) k_start = 0;
-
-                    float maxStartT = (p < P - 1) ? (phrases[p + 1].startTime - 0.05f) : (notes.empty() ? 0.0f : notes.back().time);
-                    if (maxStartT < notes[k_start].time) {
-                        maxStartT = (p < P - 1) ? phrases[p + 1].endTime : (notes.empty() ? 0.0f : notes.back().time);
-                    }
-
-                    int32_t optK = -1;
-                    int64_t optBonus = -1;
-
-                    for (int32_t k = k_start; k < numNotes; k++) {
-                        if (notes[k].time > maxStartT) break;
-                        int64_t wBonus = getWindowBonus(notes[k].time, dur);
-                        if (wBonus > optBonus) {
-                            optBonus = wBonus;
-                            optK = k;
-                        }
-                    }
-
-                    if (optK == -1) {
-                        optK = k_start;
-                        optBonus = getWindowBonus(notes[optK].time, dur);
-                    }
-
-                    if (dp[p + 1][0] >= 0) {
-                        int64_t tot = optBonus + dp[p + 1][0];
-                        if (tot > bestScore) {
-                            bestScore = tot;
-                            bestAct = eCurr;
-                            bestK = optK;
-                        }
-                    }
-                }
-
-                // Fallback test smaller energy
-                if (bestScore < 0 && eCurr >= 2) {
-                    for (int32_t testE = eCurr - 1; testE >= 2; testE--) {
-                        float dur = (float)testE * 3.75f;
+                    for (int32_t useE = eCurr; useE >= 2; useE--) {
+                        float dur = (float)useE * 3.75f;
                         int32_t k_start = phrases[p].endNote - 1;
                         if (k_start < 0) k_start = 0;
 
-                        float maxStartT = (p < P - 1) ? (phrases[p + 1].startTime - 0.05f) : (notes.empty() ? 0.0f : notes.back().time);
-                        if (maxStartT < notes[k_start].time) {
-                            maxStartT = (p < P - 1) ? phrases[p + 1].endTime : (notes.empty() ? 0.0f : notes.back().time);
-                        }
+                        float maxStartT = (p < P - 1) ? phrases[p + 1].endTime : (notes.empty() ? 0.0f : notes.back().time);
 
                         int32_t optK = -1;
                         int64_t optBonus = -1;
@@ -770,11 +769,12 @@ static void AnalyzeChartAndCalculateMetrics() {
                             optBonus = getWindowBonus(notes[optK].time, dur);
                         }
 
-                        if (dp[p + 1][0] >= 0) {
-                            int64_t tot = optBonus + dp[p + 1][0];
+                        int32_t remE = eCurr - useE;
+                        if (dp[p + 1][remE] >= 0) {
+                            int64_t tot = optBonus + dp[p + 1][remE];
                             if (tot > bestScore) {
                                 bestScore = tot;
-                                bestAct = testE;
+                                bestAct = useE;
                                 bestK = optK;
                             }
                         }
@@ -817,7 +817,7 @@ static void AnalyzeChartAndCalculateMetrics() {
                 float startT = notes[kNote].time;
                 float dur = (float)act * 3.75f;
                 milestones.push_back({ targetHit, act, startT, dur });
-                curE = 0;
+                curE = eCurr - act;
             } else {
                 curE = eCurr;
             }
@@ -1164,10 +1164,10 @@ static void CheckAndTriggerAutoSpecial() {
                 // Energy is 4/4 (full), must trigger to avoid wasting incoming energy
                 shouldTrigger = true;
                 triggerReason = "Energy 4/4 Overflow at Step #" + std::to_string(idx + 1);
-            } else if (currentHits >= m.targetHit + 60 && currentEnergy >= 2) {
-                // Failsafe fallback: player missed SP notes and is 60+ hits past targetHit
+            } else if (!g_autoPlay.load() && currentHits >= m.targetHit + 60 && currentEnergy >= 2) {
+                // Failsafe fallback ONLY for manual play if player missed SP notes
                 shouldTrigger = true;
-                triggerReason = "Milestone Fallback (Missed SP bar, triggering " + std::to_string(currentEnergy) + "⚡ at #" + std::to_string(currentHits) + ")";
+                triggerReason = "Manual Milestone Fallback (Missed SP bar, triggering " + std::to_string(currentEnergy) + "⚡ at #" + std::to_string(currentHits) + ")";
             }
             // CRITICAL: If currentHits >= m.targetHit but currentEnergy < m.requiredEnergy and < 4:
             // WE MUST HOLD! DO NOT TRIGGER! Wait for energy to charge up to required bars!
@@ -1178,8 +1178,11 @@ static void CheckAndTriggerAutoSpecial() {
     // 2. Overflow Prevention: 100% full (4 bars)
     // Never waste incoming energy if full!
     if (!shouldTrigger && currentEnergy >= 4 && currentHits >= 30) {
-        shouldTrigger = true;
-        triggerReason = "Energy 4/4 Overflow Prevention";
+        bool isNextMilestone4Bars = (idx < g_activePathMilestones.size() && g_activePathMilestones[idx].requiredEnergy == 4);
+        if (!isNextMilestone4Bars || currentHits >= g_activePathMilestones[idx].targetHit - 10) {
+            shouldTrigger = true;
+            triggerReason = "Energy 4/4 Overflow Prevention";
+        }
     }
 
     // 3. Outro Flush: ONLY near the very end of the song, flush all remaining energy!
@@ -1271,12 +1274,12 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
         }
     }
 
+    // Zero-latency Auto Special check right BEFORE scoring note, so milestone note ITSELF gets 2x bonus!
+    CheckAndTriggerAutoSpecial();
+
     if (old_Main_Notes_byy != nullptr) {
         old_Main_Notes_byy(instance, hm, b);
     }
-
-    // Auto Use Special check right upon hitting milestone notes
-    CheckAndTriggerAutoSpecial();
 
     LogHitThrottled(fret, g_greenHits.load(), g_redHits.load(), g_yellowHits.load(),
                     g_blueHits.load(), g_orangeHits.load(), getNotesHit());
