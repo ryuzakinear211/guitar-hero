@@ -224,9 +224,9 @@ public class FloatingHUD {
         tvChartScore.setPadding(0, dp(2), 0, 0);
         mChartSection.addView(tvChartScore);
 
-        // 5. Next SP Milestone Target
+        // 5. Next Combo Trigger Target
         tvChartPathNext = new TextView(mContext);
-        tvChartPathNext.setText(Html.fromHtml("🗺️ Next SP: <font color='#90A4AE'>--</font>"));
+        tvChartPathNext.setText(Html.fromHtml("🎯 Trigger Kombo: <font color='#90A4AE'>--</font>"));
         tvChartPathNext.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f);
         tvChartPathNext.setTypeface(Typeface.DEFAULT_BOLD);
         tvChartPathNext.setPadding(0, dp(2), 0, 0);
@@ -492,12 +492,12 @@ public class FloatingHUD {
                 if (tvChartPathNext != null) {
                     if (stepTotal > 0) {
                         if (stepIndex < stepTotal) {
-                            tvChartPathNext.setText(Html.fromHtml("🗺️ Next SP: <b><font color='#76FF03'>Hit #" + nextTargetHit + "</font></b> <small><font color='#00E5FF'>(" + nextReqEnergy + "⚡ Energi)</font> <font color='#FFD700'>[Step " + (stepIndex + 1) + "/" + stepTotal + "]</font></small>"));
+                            tvChartPathNext.setText(Html.fromHtml("🎯 Trigger Kombo: <b><font color='#76FF03'>#" + nextTargetHit + "</font></b> <small><font color='#00E5FF'>(" + nextReqEnergy + "⚡ Energi)</font> <font color='#FFD700'>[Step " + (stepIndex + 1) + "/" + stepTotal + "]</font></small>"));
                         } else {
-                            tvChartPathNext.setText(Html.fromHtml("🗺️ Rute SP: <b><font color='#76FF03'>Selesai ✅</font></b> <small><font color='#FFD700'>[" + stepTotal + "/" + stepTotal + "]</font></small>"));
+                            tvChartPathNext.setText(Html.fromHtml("🎯 Trigger Kombo: <b><font color='#76FF03'>Selesai ✅</font></b> <small><font color='#FFD700'>[" + stepTotal + "/" + stepTotal + "]</font></small>"));
                         }
                     } else {
-                        tvChartPathNext.setText(Html.fromHtml("🗺️ Rute SP: <font color='#B0BEC5'>Menghitung...</font>"));
+                        tvChartPathNext.setText(Html.fromHtml("🎯 Trigger Kombo: <font color='#B0BEC5'>Menghitung...</font>"));
                     }
                 }
                 if (tvChartPathRoute != null) {
@@ -517,7 +517,7 @@ public class FloatingHUD {
                     tvChartScore.setText(Html.fromHtml("🏆 Skor Maks: <font color='#90A4AE'>-- pts</font>"));
                 }
                 if (tvChartPathNext != null) {
-                    tvChartPathNext.setText(Html.fromHtml("🗺️ Next SP: <font color='#90A4AE'>--</font>"));
+                    tvChartPathNext.setText(Html.fromHtml("🎯 Trigger Kombo: <font color='#90A4AE'>--</font>"));
                 }
                 if (tvChartPathRoute != null) {
                     tvChartPathRoute.setText(Html.fromHtml("📋 Rute: <font color='#90A4AE'>--</font>"));

@@ -558,14 +558,14 @@ static void AnalyzeChartAndCalculateMetrics() {
             simC++;
         }
 
-        // Helper lambda to calculate bonus points gained in window (startT, startT + dur]
+        // Helper lambda to calculate bonus points gained in inclusive window [startT, startT + dur]
         auto getWindowBonus = [&](float startT, float dur) -> int64_t {
             float endT = startT + dur;
-            // Binary search for first note with time > startT
+            // First note with time >= startT - 0.01f
             int32_t left = 0, right = numNotes;
             while (left < right) {
                 int32_t mid = left + (right - left) / 2;
-                if (notes[mid].time <= startT) {
+                if (notes[mid].time < startT - 0.01f) {
                     left = mid + 1;
                 } else {
                     right = mid;
@@ -573,11 +573,11 @@ static void AnalyzeChartAndCalculateMetrics() {
             }
             int32_t startIdx = left;
 
-            // Binary search for first note with time > endT
+            // First note with time > endT + 0.01f
             left = startIdx; right = numNotes;
             while (left < right) {
                 int32_t mid = left + (right - left) / 2;
-                if (notes[mid].time <= endT) {
+                if (notes[mid].time <= endT + 0.01f) {
                     left = mid + 1;
                 } else {
                     right = mid;
@@ -585,19 +585,23 @@ static void AnalyzeChartAndCalculateMetrics() {
             }
             int32_t endIdx = left;
 
+            if (startIdx >= endIdx) return 0;
             return prefixBonus[endIdx] - prefixBonus[startIdx];
         };
 
         // DP Table: (P + 1) rows, 5 columns (energy 0..4)
         // dp[p][e]: maximum future score from phrase p onwards given incoming energy e
         // action[p][e]: 0 = HOLD, 2, 3, 4 = ACTIVATE with that energy
+        // triggerNote[p][e]: 0-indexed note index of optimal combo trigger
         std::vector<std::vector<int64_t>> dp(P + 1, std::vector<int64_t>(5, -1));
         std::vector<std::vector<int32_t>> action(P + 1, std::vector<int32_t>(5, 0));
+        std::vector<std::vector<int32_t>> triggerNote(P + 1, std::vector<int32_t>(5, -1));
 
         // Base case: after phrase P (end of song)
         for (int32_t e = 0; e <= 4; e++) {
             dp[P][e] = 0;
             action[P][e] = 0;
+            triggerNote[P][e] = -1;
         }
 
         // Bottom-up DP from last phrase (P - 1) backwards to 0
@@ -606,35 +610,45 @@ static void AnalyzeChartAndCalculateMetrics() {
                 int32_t eCurr = std::min(4, e + 1);
                 int64_t bestScore = -1;
                 int32_t bestAct = 0;
+                int32_t bestK = -1;
 
                 // Option 1: HOLD (if not last phrase and eCurr < 4)
                 if (p < P - 1 && eCurr < 4) {
                     if (dp[p + 1][eCurr] >= 0) {
                         bestScore = dp[p + 1][eCurr];
                         bestAct = 0; // HOLD
+                        bestK = -1;
                     }
                 }
 
                 // Option 2: ACTIVATE with eCurr (if eCurr >= 2)
                 if (eCurr >= 2) {
                     float dur = (float)eCurr * 3.75f;
-                    float startT = phrases[p].endTime;
-                    bool canActivate = false;
+                    int32_t k_start = phrases[p].endNote - 1;
+                    if (k_start < 0) k_start = 0;
 
-                    if (p == P - 1) {
-                        canActivate = true; // Last phrase of song
-                    } else if (startT + dur <= phrases[p + 1].startTime + 0.20f) {
-                        canActivate = true;
+                    float maxStartT = (p < P - 1) ? (phrases[p + 1].startTime - dur - 0.05f) : (notes.empty() ? 0.0f : notes.back().time);
+
+                    int32_t optK = -1;
+                    int64_t optBonus = -1;
+
+                    for (int32_t k = k_start; k < numNotes; k++) {
+                        if (p < P - 1 && notes[k].time > maxStartT) {
+                            break; // Subsequent notes would cause SP to overlap phrase p+1
+                        }
+                        int64_t wBonus = getWindowBonus(notes[k].time, dur);
+                        if (wBonus > optBonus) {
+                            optBonus = wBonus;
+                            optK = k;
+                        }
                     }
 
-                    if (canActivate) {
-                        int64_t wBonus = getWindowBonus(startT, dur);
-                        if (dp[p + 1][0] >= 0) {
-                            int64_t tot = wBonus + dp[p + 1][0];
-                            if (tot > bestScore) {
-                                bestScore = tot;
-                                bestAct = eCurr; // ACTIVATE with eCurr
-                            }
+                    if (optK != -1 && dp[p + 1][0] >= 0) {
+                        int64_t tot = optBonus + dp[p + 1][0];
+                        if (tot > bestScore) {
+                            bestScore = tot;
+                            bestAct = eCurr; // ACTIVATE with eCurr
+                            bestK = optK;
                         }
                     }
                 }
@@ -643,15 +657,29 @@ static void AnalyzeChartAndCalculateMetrics() {
                 if (bestScore < 0 && eCurr >= 2) {
                     for (int32_t testE = eCurr - 1; testE >= 2; testE--) {
                         float dur = (float)testE * 3.75f;
-                        float startT = phrases[p].endTime;
-                        if (p == P - 1 || startT + dur <= phrases[p + 1].startTime + 0.20f) {
-                            int64_t wBonus = getWindowBonus(startT, dur);
-                            if (dp[p + 1][0] >= 0) {
-                                int64_t tot = wBonus + dp[p + 1][0];
-                                if (tot > bestScore) {
-                                    bestScore = tot;
-                                    bestAct = testE;
-                                }
+                        int32_t k_start = phrases[p].endNote - 1;
+                        if (k_start < 0) k_start = 0;
+
+                        float maxStartT = (p < P - 1) ? (phrases[p + 1].startTime - dur - 0.05f) : (notes.empty() ? 0.0f : notes.back().time);
+
+                        int32_t optK = -1;
+                        int64_t optBonus = -1;
+
+                        for (int32_t k = k_start; k < numNotes; k++) {
+                            if (p < P - 1 && notes[k].time > maxStartT) break;
+                            int64_t wBonus = getWindowBonus(notes[k].time, dur);
+                            if (wBonus > optBonus) {
+                                optBonus = wBonus;
+                                optK = k;
+                            }
+                        }
+
+                        if (optK != -1 && dp[p + 1][0] >= 0) {
+                            int64_t tot = optBonus + dp[p + 1][0];
+                            if (tot > bestScore) {
+                                bestScore = tot;
+                                bestAct = testE;
+                                bestK = optK;
                             }
                         }
                     }
@@ -662,14 +690,18 @@ static void AnalyzeChartAndCalculateMetrics() {
                     if (p < P - 1) {
                         bestScore = (dp[p + 1][eCurr] >= 0) ? dp[p + 1][eCurr] : 0;
                         bestAct = 0;
+                        bestK = -1;
                     } else {
                         bestScore = 0;
                         bestAct = (eCurr >= 2) ? eCurr : 0;
+                        bestK = phrases[p].endNote - 1;
+                        if (bestK < 0) bestK = 0;
                     }
                 }
 
                 dp[p][e] = bestScore;
                 action[p][e] = bestAct;
+                triggerNote[p][e] = bestK;
             }
         }
 
@@ -680,10 +712,16 @@ static void AnalyzeChartAndCalculateMetrics() {
             int32_t eCurr = std::min(4, curE + 1);
 
             if (act >= 2) {
-                int32_t targetHit = phrases[p].endNote;
+                int32_t kNote = triggerNote[p][curE];
+                if (kNote < 0 || kNote >= numNotes) {
+                    kNote = phrases[p].endNote - 1;
+                    if (kNote < 0) kNote = 0;
+                }
+                int32_t targetHit = kNote + 1; // 1-indexed combo hit
                 if (targetHit < 30) targetHit = 30; // Wait for 4x base multiplier
+                float startT = notes[kNote].time;
                 float dur = (float)act * 3.75f;
-                milestones.push_back({ targetHit, act, phrases[p].endTime, dur });
+                milestones.push_back({ targetHit, act, startT, dur });
                 curE = 0; // Reset energy after activation
             } else {
                 curE = eCurr;
@@ -691,11 +729,22 @@ static void AnalyzeChartAndCalculateMetrics() {
         }
 
         // Outro check: if energy remained after the last phrase (and was not yet scheduled)
-        if (curE >= 2 && !notes.empty() && (milestones.empty() || milestones.back().targetHit != phrases.back().endNote)) {
-            int32_t outroHit = phrases.back().endNote;
-            if (outroHit < 30) outroHit = 30;
+        if (curE >= 2 && !notes.empty() && (milestones.empty() || milestones.back().targetHit < phrases.back().endNote)) {
+            int32_t k_start = phrases.back().endNote - 1;
+            if (k_start < 0) k_start = 0;
             float dur = (float)curE * 3.75f;
-            milestones.push_back({ outroHit, curE, phrases.back().endTime, dur });
+            int32_t bestK = k_start;
+            int64_t bestB = -1;
+            for (int32_t k = k_start; k < numNotes; k++) {
+                int64_t b = getWindowBonus(notes[k].time, dur);
+                if (b > bestB) {
+                    bestB = b;
+                    bestK = k;
+                }
+            }
+            int32_t outroHit = bestK + 1;
+            if (outroHit < 30) outroHit = 30;
+            milestones.push_back({ outroHit, curE, notes[bestK].time, dur });
         }
     } else {
         // Fallback for custom charts without star notes
@@ -743,10 +792,10 @@ static void AnalyzeChartAndCalculateMetrics() {
         }
         baseScore += noteBase + sustainBase;
 
-        // Check if note falls within an active SP window
+        // Check if note falls within an active SP window (inclusive)
         bool isSpActive = false;
         for (const auto &m : milestones) {
-            if (notes[i].time > m.startTime && notes[i].time <= (m.startTime + m.duration)) {
+            if (notes[i].time >= m.startTime - 0.01f && notes[i].time <= (m.startTime + m.duration + 0.01f)) {
                 isSpActive = true;
                 break;
             }
@@ -791,6 +840,11 @@ static void AnalyzeChartAndCalculateMetrics() {
              title.c_str(), g_songDurationStr.c_str(), duration, (int)notes.size(),
              spNotesCount, totalPhrases, (long long)bestScore, (long long)baseScore,
              pathSummary.c_str(), milestones.size());
+    for (size_t s = 0; s < milestones.size(); s++) {
+        LogDebug("   -> Step %zu/%zu: Trigger Hit #%d (%d bars, t=%.2fs, dur=%.2fs)",
+                 s + 1, milestones.size(), milestones[s].targetHit, milestones[s].requiredEnergy,
+                 milestones[s].startTime, milestones[s].duration);
+    }
 }
 
 // Hook ed::bab (Chart loader & Song detector)
@@ -891,7 +945,7 @@ static void CheckAndTriggerAutoSpecial() {
     pthread_mutex_lock(&g_chartAnalysisMutex);
     size_t idx = g_currentMilestoneIndex.load();
     // Catch up index if hits have far exceeded older milestone
-    while (idx < g_activePathMilestones.size() && currentHits > g_activePathMilestones[idx].targetHit + 25) {
+    while (idx < g_activePathMilestones.size() && currentHits > g_activePathMilestones[idx].targetHit + 80) {
         idx++;
     }
     g_currentMilestoneIndex = idx;
