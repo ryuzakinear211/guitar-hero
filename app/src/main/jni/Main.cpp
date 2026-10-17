@@ -890,6 +890,8 @@ static bool FinishProfilingAndSaveProfile() {
     g_profilingComplete = true;
     pthread_mutex_unlock(&g_chartAnalysisMutex);
 
+    g_profilingMode = false; // Automatically turn off profiling/recording mode once profile is saved & applied
+
     LogDebug("🎉 [ProfileEngine] Profiling complete & applied! Title: '%s' | Notes: %d | SP Phrases: %d | Base: %lld | Max Theoretical: %lld | Path: %s (%zu steps)",
              prof.songTitle.c_str(), prof.totalNotes, prof.spPhrasesCount,
              (long long)prof.pureBaseScore, (long long)prof.maxTheoreticalScore,
@@ -1064,6 +1066,10 @@ static void AnalyzeChartAndCalculateMetrics() {
     // Check if Saved Profile exists on disk
     SavedSongProfile diskProfile;
     bool profileLoaded = LoadProfileFromDisk(title, numNotes, diskProfile);
+    if (!profileLoaded && g_hasSavedProfile.load() && g_currentSavedProfile.isValid) {
+        diskProfile = g_currentSavedProfile;
+        profileLoaded = true;
+    }
 
     if (profileLoaded) {
         milestones = diskProfile.milestones;
@@ -1592,16 +1598,23 @@ void hook_Main_Scorer_cdc(void *instance, int32_t a, int32_t b) {
 
 // Automatic Special Power Trigger based on Dynamic Real-Time Target & Optimal Route
 static void CheckAndTriggerAutoSpecial() {
-    // Profiling Mode: strictly suppress special ability! Pure base run only!
-    if (g_profilingMode.load()) {
+    // Profiling Mode: strictly suppress special ability only when actively recording without a saved profile!
+    if (g_profilingMode.load() && !g_hasSavedProfile.load()) {
         return;
     }
 
     if (!g_autoUseSpecial.load()) {
         return;
     }
+
+    // Ensure valid pointer to Main_Special instance
     if (mainSpecialInstance == nullptr || (uintptr_t)mainSpecialInstance < 0x10000) {
-        return;
+        if (mainInstance != nullptr && (uintptr_t)mainInstance > 0x10000) {
+            mainSpecialInstance = *(void **)((uintptr_t)mainInstance + 0xc0);
+        }
+        if (mainSpecialInstance == nullptr || (uintptr_t)mainSpecialInstance < 0x10000) {
+            return;
+        }
     }
     if (Main_Special_bzk == nullptr) {
         return;
@@ -1613,11 +1626,8 @@ static void CheckAndTriggerAutoSpecial() {
         return;
     }
 
-    // Check timeBlocked at offset 0x24
-    float timeBlocked = *(float *)((uintptr_t)mainSpecialInstance + 0x24);
-    if (timeBlocked > 0.0f) {
-        return;
-    }
+    // REMOVED timeBlocked > 0.0f check:
+    // Native Main_Special_bzk already accurately checks: timeBlocked > Time.realtimeSinceStartup.
 
     // Check current energy bars (epe: lx/ObscuredInt at offset 0x40)
     int32_t currentEnergy = 0;
@@ -1658,13 +1668,12 @@ static void CheckAndTriggerAutoSpecial() {
                 // Energy is 4/4 (full), must trigger to avoid wasting incoming energy
                 shouldTrigger = true;
                 triggerReason = "Energy 4/4 Overflow at Step #" + std::to_string(idx + 1);
-            } else if (!g_autoPlay.load() && currentHits >= m.targetHit + 60 && currentEnergy >= 2) {
-                // Failsafe fallback ONLY for manual play if player missed SP notes
+            } else if (currentHits >= m.targetHit + 20 && currentEnergy >= 2) {
+                // Adaptive fallback: if required bars not yet reached after +20 notes, trigger available energy!
                 shouldTrigger = true;
-                triggerReason = "Manual Milestone Fallback (Missed SP bar, triggering " + std::to_string(currentEnergy) + "⚡ at #" + std::to_string(currentHits) + ")";
+                triggerReason = "Adaptive Milestone Fallback (Triggering " + std::to_string(currentEnergy) + "⚡ at #" + std::to_string(currentHits) + ")";
             }
-            // CRITICAL: If currentHits >= m.targetHit but currentEnergy < m.requiredEnergy and < 4:
-            // WE MUST HOLD! DO NOT TRIGGER! Wait for energy to charge up to required bars!
+            // If currentHits >= m.targetHit but currentEnergy < 2: hold until minimum 2 bars are ready
         }
         // If currentHits < m.targetHit: HOLD! DO NOT TRIGGER!
     }
@@ -1951,13 +1960,10 @@ void hook_Main_Notes_bzc(void *instance, void *hm) {
 }
 
 // Hook Main_Notes::bza (RVA: 0x20b992c)
-// Called when a sustain / rastro is dropped or released early
+// Called continuously every frame while a sustain note is held to compute tail delta and add points to score
 void (*old_Main_Notes_bza)(void *instance, void *hm) = nullptr;
 void hook_Main_Notes_bza(void *instance, void *hm) {
-    if (g_autoPlay.load()) {
-        // Under Auto Play, do not allow sustain to be prematurely broken!
-        return;
-    }
+    // Unconditionally execute native bza so continuous sustain score ticks are accumulated!
     if (old_Main_Notes_bza != nullptr) {
         old_Main_Notes_bza(instance, hm);
     }
@@ -2632,9 +2638,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     const char *features[] = {
             OBFUSCATE("Category_⚡ Automation"),
             OBFUSCATE("10_Toggle_Auto Play"),
-            OBFUSCATE("11_Toggle_Auto Activate Special (Target & Optimal Route)"),
+            OBFUSCATE("11_Toggle_Auto Activate Special (Rute Profil & Target)"),
             OBFUSCATE("13_InputValue_Target Skor (0 = Auto Max)"),
-            OBFUSCATE("14_Toggle_🔬 Analyze Song (Profiling Run)"),
+            OBFUSCATE("14_Toggle_🔬 Rekam Profil Lagu (Pure Base Run - Special OFF)"),
             OBFUSCATE("15_Button_💾 Save / Apply Current Chart Profile"),
 
             OBFUSCATE("Category_⭐ Special & Multiplier"),
@@ -2651,7 +2657,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>⭐ Auto Special: Otomatis aktivasi SP berbasis rute profil tersimpan.<br>🔬 Analyze Song: Pure base run untuk profil rute & estimasi skor optimal.<br>💾 Save Profile: Simpan profil lagu permanen ke storage.<br>🎯 Target Skor: Input manual target skor (cth: 75.000).<br>⚡ Instant Special: Energi langsung 100% saat note bintang kena.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.<br>📊 Chart HUD: Tampilan status profil, trigger kombo, & prediksi real-time.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran + sustain utuh.<br>⭐ Auto Special: Otomatis aktivasi SP berbasis rute profil tersimpan.<br>🔬 Rekam Profil: Rekam chart baru tanpa special (cukup 1x main).<br>💾 Save Profile: Simpan profil rute lagu permanen ke storage.<br>🎯 Target Skor: Input manual target skor (cth: 75.000).<br>⚡ Instant Special: Energi langsung 100% saat note bintang kena.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.<br>📊 Chart HUD: Tampilan status profil, trigger kombo, & prediksi real-time.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -2694,8 +2700,11 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
         // Auto Activate Special (Target & Optimal Route) Feature (OFF by default)
         case 11:
             g_autoUseSpecial = boolean;
+            if (boolean) {
+                g_profilingMode = false; // Turn off profiling/recording mode so Auto Special can execute immediately
+            }
             LogDebug("Auto Activate Special toggled: %d", boolean);
-            Toast(env, obj, boolean ? OBFUSCATE("⭐ Auto Activate Special: AKTIF") : OBFUSCATE("⭐ Auto Activate Special: NONAKTIF"), ToastLength::LENGTH_SHORT);
+            Toast(env, obj, boolean ? OBFUSCATE("⭐ Auto Activate Special: AKTIF (Menggunakan Rute Profil)") : OBFUSCATE("⭐ Auto Activate Special: NONAKTIF"), ToastLength::LENGTH_SHORT);
             break;
 
         // Manual Target Score Feature (0 = Auto Max)
@@ -2711,10 +2720,10 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             }
             break;
 
-        // Analyze Song (Profiling Run) (OFF by default)
+        // Rekam Profil Lagu (Pure Base Run) (OFF by default)
         case 14:
             g_profilingMode = boolean;
-            LogDebug("Analyze Song (Profiling Run) toggled: %d", boolean);
+            LogDebug("Rekam Profil Lagu (Profiling Run) toggled: %d", boolean);
             if (boolean) {
                 g_profilingComplete = false;
                 g_autoPlay = true; // Auto Play must be active for pure base run
@@ -2722,9 +2731,9 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
                 pthread_mutex_lock(&g_recordedNotesMutex);
                 g_recordedNotes.clear();
                 pthread_mutex_unlock(&g_recordedNotesMutex);
-                Toast(env, obj, OBFUSCATE("🔬 Mode Analisis: AKTIF!\nAuto Play ON, Special OFF. Lagu dimainkan bersih dari awal untuk rekam profil."), ToastLength::LENGTH_LONG);
+                Toast(env, obj, OBFUSCATE("🔬 Mode Rekam Profil: AKTIF!\nAuto Play ON, Special OFF. Lagu dimainkan bersih dari awal untuk rekam profil."), ToastLength::LENGTH_LONG);
             } else {
-                Toast(env, obj, OBFUSCATE("🔬 Mode Analisis: NONAKTIF"), ToastLength::LENGTH_SHORT);
+                Toast(env, obj, OBFUSCATE("🔬 Mode Rekam Profil: NONAKTIF"), ToastLength::LENGTH_SHORT);
             }
             break;
 
