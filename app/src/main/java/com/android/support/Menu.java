@@ -56,6 +56,7 @@ import android.widget.Toast;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 
 import static android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
 import static android.view.ViewGroup.LayoutParams.MATCH_PARENT;
@@ -772,7 +773,11 @@ public class Menu {
 
         final Button button = new Button(getContext);
         int num = Preferences.loadPrefInt(featName, featNum);
-        button.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + ((num == 0) ? 1 : num) + "</font>"));
+        if (featNum == 13) {
+            button.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + (num <= 0 ? "Auto (Max)" : String.format(Locale.US, "%,d", num)) + "</font>"));
+        } else {
+            button.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + ((num == 0) ? 1 : num) + "</font>"));
+        }
         button.setAllCaps(false);
         button.setLayoutParams(layoutParams);
         button.setBackgroundColor(BTN_COLOR);
@@ -782,8 +787,16 @@ public class Menu {
             public void onClick(View view) {
                 AlertDialog.Builder alertName = new AlertDialog.Builder(getContext);
                 final EditText editText = new EditText(getContext);
-                if (maxValue != 0)
+                if (featNum == 13) {
+                    editText.setHint("Target Skor (0 = Auto Max)");
+                    int curVal = Preferences.loadPrefInt(featName, featNum);
+                    if (curVal > 0) {
+                        editText.setText(String.valueOf(curVal));
+                        editText.setSelection(editText.getText().length());
+                    }
+                } else if (maxValue != 0) {
                     editText.setHint("Max value: " + maxValue);
+                }
                 editText.setInputType(InputType.TYPE_CLASS_NUMBER);
                 editText.setKeyListener(DigitsKeyListener.getInstance("0123456789-"));
                 InputFilter[] FilterArray = new InputFilter[1];
@@ -802,7 +815,7 @@ public class Menu {
                 });
                 editText.requestFocus();
 
-                alertName.setTitle("Input number");
+                alertName.setTitle(featNum == 13 ? "🎯 Target Skor Lagu" : "Input number");
                 alertName.setView(editText);
                 LinearLayout layoutName = new LinearLayout(getContext);
                 layoutName.setOrientation(LinearLayout.VERTICAL);
@@ -814,6 +827,7 @@ public class Menu {
                         int num;
                         try {
                             num = Integer.parseInt(TextUtils.isEmpty(editText.getText().toString()) ? "0" : editText.getText().toString());
+                            if (num < 0) num = 0;
                             if (maxValue != 0 && num >= maxValue)
                                 num = maxValue;
                         } catch (NumberFormatException ex) {
@@ -823,7 +837,11 @@ public class Menu {
                                 num = 2147483640;
                         }
 
-                        button.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + num + "</font>"));
+                        if (featNum == 13) {
+                            button.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + (num <= 0 ? "Auto (Max)" : String.format(Locale.US, "%,d", num)) + "</font>"));
+                        } else {
+                            button.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + num + "</font>"));
+                        }
                         Preferences.changeFeatureInt(featName, featNum, num);
 
                         editText.setFocusable(false);

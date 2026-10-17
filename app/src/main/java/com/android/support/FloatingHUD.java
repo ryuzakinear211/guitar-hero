@@ -409,6 +409,7 @@ public class FloatingHUD {
     private TextView tvTitle;
     private int pAuto = -1;
     private int pAutoMaster = -1;
+    private int pTargetScore = 0;
 
     private void initUpdater() {
         mHandler = new Handler(Looper.getMainLooper());
@@ -471,6 +472,10 @@ public class FloatingHUD {
             int stepTotal = obj.optInt("stepTotal", 0);
             int nextTargetHit = obj.optInt("nextTargetHit", 0);
             int nextReqEnergy = obj.optInt("nextReqEnergy", 0);
+            int targetScore = obj.optInt("targetScore", 0);
+            long predictedScore = obj.optLong("predictedScore", bestScore);
+            String targetStatus = obj.optString("targetStatus", "AUTO MAX");
+            pTargetScore = targetScore;
 
             if (hasData) {
                 if (tvChartTitle != null) {
@@ -483,10 +488,18 @@ public class FloatingHUD {
                     tvChartSp.setText(Html.fromHtml("⭐ Note SP: <b><font color='#E040FB'>" + spNotes + "</font></b> <small><font color='#B388FF'>(" + spPhrases + " Frase / Energi)</font></small>"));
                 }
                 if (tvChartScore != null) {
-                    if (baseScore > 0) {
-                        tvChartScore.setText(Html.fromHtml("🏆 Skor Maks: <b><font color='#FFD700'>" + String.format(Locale.US, "%,d", bestScore) + "</font></b> <small><font color='#B0BEC5'>(FC: " + String.format(Locale.US, "%,d", baseScore) + ")</font></small>"));
+                    String predStr = String.format(Locale.US, "%,d", predictedScore);
+                    String maxStr = String.format(Locale.US, "%,d", bestScore);
+                    if (targetScore > 0) {
+                        String targetStr = String.format(Locale.US, "%,d", targetScore);
+                        String statusColor = targetStatus.contains("DEFICIT") ? "#FF9100" : (targetStatus.contains("TERCAPAI") ? "#00E676" : "#76FF03");
+                        tvChartScore.setText(Html.fromHtml("🎯 Target: <b><font color='#00E5FF'>" + targetStr + "</font></b> • 🔮 Prediksi: <b><font color='" + statusColor + "'>" + predStr + "</font></b><br><small><font color='" + statusColor + "'>[" + targetStatus + "]</font> <font color='#B0BEC5'>(Maks: " + maxStr + ")</font></small>"));
                     } else {
-                        tvChartScore.setText(Html.fromHtml("🏆 Skor Maks: <b><font color='#FFD700'>" + String.format(Locale.US, "%,d", bestScore) + "</font></b>"));
+                        if (baseScore > 0) {
+                            tvChartScore.setText(Html.fromHtml("🏆 Skor Maks: <b><font color='#FFD700'>" + maxStr + "</font></b> • 🔮 Prediksi: <b><font color='#76FF03'>" + predStr + "</font></b><br><small><font color='#B0BEC5'>(FC: " + String.format(Locale.US, "%,d", baseScore) + ")</font></small>"));
+                        } else {
+                            tvChartScore.setText(Html.fromHtml("🏆 Skor Maks: <b><font color='#FFD700'>" + maxStr + "</font></b> • 🔮 Prediksi: <b><font color='#76FF03'>" + predStr + "</font></b>"));
+                        }
                     }
                 }
                 if (tvChartPathNext != null) {
@@ -497,7 +510,7 @@ public class FloatingHUD {
                             tvChartPathNext.setText(Html.fromHtml("🎯 Trigger Kombo: <b><font color='#76FF03'>Selesai ✅</font></b> <small><font color='#FFD700'>[" + stepTotal + "/" + stepTotal + "]</font></small>"));
                         }
                     } else {
-                        tvChartPathNext.setText(Html.fromHtml("🎯 Trigger Kombo: <font color='#B0BEC5'>Menghitung...</font>"));
+                        tvChartPathNext.setText(Html.fromHtml("🎯 Trigger Kombo: <font color='#B0BEC5'>Dinamis Real-Time</font>"));
                     }
                 }
                 if (tvChartPathRoute != null) {
@@ -575,10 +588,11 @@ public class FloatingHUD {
 
         // Live Combo & Score display
         String scoreFormatted = String.format(Locale.US, "%,d", score);
+        String targetPart = (pTargetScore > 0) ? " <small><font color='#B0BEC5'>/ " + String.format(Locale.US, "%,d", pTargetScore) + "</font></small>" : "";
         if (combo >= 30) {
-            tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b> <small><font color='#00E676'>(4x)</font></small> <font color='#90A4AE'>•</font> 🎯 Skor: <b><font color='#00E5FF'>" + scoreFormatted + "</font></b>"));
+            tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b> <small><font color='#00E676'>(4x)</font></small> <font color='#90A4AE'>•</font> 🎯 Skor: <b><font color='#00E5FF'>" + scoreFormatted + "</font></b>" + targetPart));
         } else {
-            tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b> <font color='#90A4AE'>•</font> 🎯 Skor: <b><font color='#00E5FF'>" + scoreFormatted + "</font></b>"));
+            tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b> <font color='#90A4AE'>•</font> 🎯 Skor: <b><font color='#00E5FF'>" + scoreFormatted + "</font></b>" + targetPart));
         }
 
         int allPlayed = total + miss;
