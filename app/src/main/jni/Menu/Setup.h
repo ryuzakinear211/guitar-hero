@@ -1,4 +1,6 @@
 #include <sstream>
+#include <string>
+#include <vector>
 #include "Menu/Menu.h"
 #include "Menu/get_device_api_level_inlines.h"
 
@@ -31,12 +33,37 @@ void setDialog(jobject ctx, JNIEnv *env, const char *title, const char *msg){
 }
 
 void Toast(JNIEnv *env, jobject thiz, const char *text, int length) {
-    jstring jstr = env->NewStringUTF(text);
+    if (!text || !thiz) return;
+
+    std::string s(text);
+    std::vector<std::string> lines;
+    std::stringstream ss(s);
+    std::string line;
+    while (std::getline(ss, line)) {
+        lines.push_back(line);
+    }
+
     jclass toast = env->FindClass(OBFUSCATE("android/widget/Toast"));
-    jmethodID methodMakeText =env->GetStaticMethodID(toast,OBFUSCATE("makeText"),OBFUSCATE("(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;"));
-    jobject toastobj = env->CallStaticObjectMethod(toast, methodMakeText,thiz, jstr, length);
+    jmethodID methodMakeText = env->GetStaticMethodID(toast, OBFUSCATE("makeText"), OBFUSCATE("(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;"));
     jmethodID methodShow = env->GetMethodID(toast, OBFUSCATE("show"), OBFUSCATE("()V"));
-    env->CallVoidMethod(toastobj, methodShow);
+
+    if (lines.size() <= 2) {
+        jstring jstr = env->NewStringUTF(text);
+        jobject toastobj = env->CallStaticObjectMethod(toast, methodMakeText, thiz, jstr, length);
+        env->CallVoidMethod(toastobj, methodShow);
+    } else {
+        // Android 11+ caps text toasts to 2 lines and truncates with '...'.
+        // If a message has > 2 lines, chunk it into 2-line toasts so all content is visible.
+        for (size_t i = 0; i < lines.size(); i += 2) {
+            std::string chunk = lines[i];
+            if (i + 1 < lines.size()) {
+                chunk += "\n" + lines[i + 1];
+            }
+            jstring jstr = env->NewStringUTF(chunk.c_str());
+            jobject toastobj = env->CallStaticObjectMethod(toast, methodMakeText, thiz, jstr, length);
+            env->CallVoidMethod(toastobj, methodShow);
+        }
+    }
 }
 
 void startActivityPermisson(JNIEnv *env, jobject ctx){

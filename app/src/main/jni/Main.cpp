@@ -2047,8 +2047,6 @@ void hook_lk_cxm(void *instance, void *songScoreInfo, bool b) {
     }
 }
 
-static std::atomic<bool> g_isRankingOpening{false};
-
 // 28. Hook MenuMus_Ranking::Open (RVA: 0x20e4454) - Song ranking dialog launcher
 void (*old_MenuMus_Ranking_Open)(void *instance, void *listaSong) = nullptr;
 void hook_MenuMus_Ranking_Open(void *instance, void *listaSong) {
@@ -2082,41 +2080,11 @@ void hook_MenuMus_Ranking_Open(void *instance, void *listaSong) {
         }
     }
     if (old_MenuMus_Ranking_Open != nullptr) {
-        g_isRankingOpening = true;
         old_MenuMus_Ranking_Open(instance, listaSong);
-        g_isRankingOpening = false;
     }
 }
 
-// 29. Hook MenuMus_Ranking::clh (RVA: 0x20ec458) - Ranking coroutine launcher
-void *(*old_MenuMus_Ranking_clh)(void *instance, int32_t a, int32_t b, bool c, bool d) = nullptr;
-void *hook_MenuMus_Ranking_clh(void *instance, int32_t a, int32_t b, bool c, bool d) {
-    int32_t rankTypeToUse = b;
-
-    if (g_isRankingOpening.load()) {
-        // Initial dialog open from MenuMus_Ranking::Open():
-        // Override default Monthly (0) to All-Time (2) so the highest chart record is pulled automatically
-        rankTypeToUse = 2; // RankType::songAll (All-Time)
-        LogDebug("[Ranking] Initial Open: Defaulting to All-Time category (2) for Song ID %d", a);
-        if (instance != nullptr && (uintptr_t)instance > 0x10000) {
-            *(int32_t *)((uintptr_t)instance + 0x28) = 2; // MenuMus_Ranking.eux = songAll
-        }
-    } else {
-        // User explicitly clicked a tab button (Monthly=0, Friends=1, All=2, Reload):
-        // Respect user's selection and do NOT force All-Time!
-        LogDebug("[Ranking] User tab switch: Requesting category %d for Song ID %d", b, a);
-        if (instance != nullptr && (uintptr_t)instance > 0x10000) {
-            *(int32_t *)((uintptr_t)instance + 0x28) = b; // Keep selected category in MenuMus_Ranking.eux
-        }
-    }
-
-    if (old_MenuMus_Ranking_clh != nullptr) {
-        return old_MenuMus_Ranking_clh(instance, a, rankTypeToUse, c, d);
-    }
-    return nullptr;
-}
-
-// 30. Hook jw::MoveNext (RVA: 0x20ed1ac) - Ranking leaderboard parser coroutine
+// 29. Hook jw::MoveNext (RVA: 0x20ed1ac) - Ranking leaderboard parser coroutine
 bool (*old_jw_MoveNext)(void *instance) = nullptr;
 bool hook_jw_MoveNext(void *instance) {
     bool result = false;
@@ -2356,15 +2324,11 @@ void *hack_thread(void *) {
     HOOK("0x20e4454", hook_MenuMus_Ranking_Open, old_MenuMus_Ranking_Open);
     LogDebug("Hook MenuMus_Ranking::Open (0x20e4454): %s", old_MenuMus_Ranking_Open != nullptr ? "SUCCESS" : "FAILED");
 
-    // 29. Hook MenuMus_Ranking::clh (0x20ec458) - Ranking coroutine launcher (Forces All-Time Category)
-    HOOK("0x20ec458", hook_MenuMus_Ranking_clh, old_MenuMus_Ranking_clh);
-    LogDebug("Hook MenuMus_Ranking::clh (0x20ec458): %s", old_MenuMus_Ranking_clh != nullptr ? "SUCCESS" : "FAILED");
-
-    // 30. Hook jw::MoveNext (0x20ed1ac) - Ranking leaderboard parser coroutine
+    // 29. Hook jw::MoveNext (0x20ed1ac) - Ranking leaderboard parser coroutine
     HOOK("0x20ed1ac", hook_jw_MoveNext, old_jw_MoveNext);
     LogDebug("Hook jw::MoveNext (0x20ed1ac): %s", old_jw_MoveNext != nullptr ? "SUCCESS" : "FAILED");
 
-    // 31. Hook ed::bab (0x1c31de0) - Chart loader
+    // 30. Hook ed::bab (0x1c31de0) - Chart loader
     HOOK("0x1c31de0", hook_ed_bab, old_ed_bab);
     LogDebug("Hook ed::bab (0x1c31de0): %s", old_ed_bab != nullptr ? "SUCCESS" : "FAILED");
 
@@ -2611,7 +2575,7 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             }
 
             char rankingMsg[256];
-            snprintf(rankingMsg, sizeof(rankingMsg), "top score: %d\nsong best score: %d\nsepcial hit: %s",
+            snprintf(rankingMsg, sizeof(rankingMsg), "top score: %d | song best: %d\nsepcial hit: %s",
                      topScore, songBestScore, specialRoute.c_str());
             LogDebug("User clicked Check Ranking Score:\n%s", rankingMsg);
             Toast(env, obj, rankingMsg, ToastLength::LENGTH_LONG);
