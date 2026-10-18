@@ -57,6 +57,9 @@ static void createDirectoryRecursive(const char *path) {
     mkdir(temp, 0777);
 }
 
+static char g_resolvedLogPath[512] = "";
+static bool g_logPathResolved = false;
+
 void LogDebug(const char *fmt, ...) {
     char message[1024];
     va_list args;
@@ -74,11 +77,23 @@ void LogDebug(const char *fmt, ...) {
     strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &tm_info);
 
     pthread_mutex_lock(&g_logMutex);
-    for (const char *dir : CANDIDATE_LOG_DIRS) {
-        createDirectoryRecursive(dir);
-        char filePath[512];
-        snprintf(filePath, sizeof(filePath), "%s/guitar_hero_debug.log", dir);
-        FILE *fp = fopen(filePath, "a");
+    if (!g_logPathResolved) {
+        for (const char *dir : CANDIDATE_LOG_DIRS) {
+            createDirectoryRecursive(dir);
+            char filePath[512];
+            snprintf(filePath, sizeof(filePath), "%s/guitar_hero_debug.log", dir);
+            FILE *fp = fopen(filePath, "a");
+            if (fp != nullptr) {
+                snprintf(g_resolvedLogPath, sizeof(g_resolvedLogPath), "%s", filePath);
+                g_logPathResolved = true;
+                fprintf(fp, "[%s] %s\n", timeBuf, message);
+                fflush(fp);
+                fclose(fp);
+                break;
+            }
+        }
+    } else {
+        FILE *fp = fopen(g_resolvedLogPath, "a");
         if (fp != nullptr) {
             fprintf(fp, "[%s] %s\n", timeBuf, message);
             fflush(fp);
@@ -142,8 +157,9 @@ static void *mainMultiplierInstance = nullptr; // Pointer to Main_Multiplier
 
 // Freeze Special Feature State (Single Toggle, OFF by default)
 static std::atomic<bool> g_freezeSpecial{false};
+static std::atomic<bool> g_specialActivatedForSong{false};
 static float g_frozenSpecialSongTime = -1.0f;
-static void applyFreezeSpecialState(bool enable);
+static void applyFreezeSpecialState(bool enable, bool force = false);
 
 // Helper: Inspects active notes in Main_Notes::eoq directly from the engine
 // Returns true if a note on this fret is hit and actively sustaining
@@ -586,9 +602,9 @@ void hook_Main_Notes_byv(void *instance) {
     g_currentScore = 0;
     g_scoreFrozen = false;
     g_frozenSpecialSongTime = -1.0f;
-    if (g_freezeSpecial.load() || (g_targetScore.load() > 0 && g_autoPlay.load())) {
-        applyFreezeSpecialState(true);
-    }
+    g_specialActivatedForSong = false;
+    mainSpecialInstance = nullptr;
+    mainMultiplierInstance = nullptr;
 
     if (old_Main_Notes_byv != nullptr) {
         old_Main_Notes_byv(instance);
@@ -830,23 +846,30 @@ void hook_Main_Update(void *instance) {
     }
 
     // Continually ensure Freeze Special & x8 multiplier lock during active gameplay
-    if (g_freezeSpecial.load()) {
-        if (mainSpecialInstance != nullptr) {
-            *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = true; // active
-            *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true; // spShow
-        }
-        if (mainMultiplierInstance != nullptr) {
-            applyFreezeSpecialState(true);
+    bool freezeSpecialActive = g_freezeSpecial.load() || (g_autoPlay.load() && g_targetScore.load() > 0);
+    if (freezeSpecialActive) {
+        if (!g_specialActivatedForSong.exchange(true)) {
+            // First frame with active instances in this song: activate special once!
+            applyFreezeSpecialState(true, true);
+        } else {
+            // Per-frame silent lock: directly maintain memory fields without audio/log overhead!
+            if (mainSpecialInstance != nullptr) {
+                *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = true; // active
+                *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true; // spShow
+            }
+            if (mainMultiplierInstance != nullptr) {
+                void *erh = *(void **)((uintptr_t)mainMultiplierInstance + 0x20);
+                if (erh != nullptr && lx_set_Value != nullptr) {
+                    lx_set_Value(erh, 8);
+                }
+                *(int32_t *)((uintptr_t)mainMultiplierInstance + 0x28) = 8;
+            }
         }
     }
 
     // Continually ensure Target Score management & client-side freeze
     if (g_targetScore.load() > 0) {
         int32_t target = g_targetScore.load();
-
-        if (g_autoPlay.load() && !g_freezeSpecial.load()) {
-            applyFreezeSpecialState(true);
-        }
 
         float sTime = 0.0f;
         if (mainInstance != nullptr) {
@@ -1105,13 +1128,18 @@ void hook_Main_Multiplier_cci(void *instance) {
     }
 }
 
-static void applyFreezeSpecialState(bool enable) {
+static void applyFreezeSpecialState(bool enable, bool force) {
+    if (!force && g_freezeSpecial.load() == enable) {
+        return;
+    }
+
     g_freezeSpecial = enable;
     g_frozenSpecialSongTime = -1.0f;
     LogDebug("[FreezeSpecial] State changed: %s", enable ? "ENABLED (x8 Locked)" : "DISABLED");
 
     if (enable) {
         if (mainSpecialInstance != nullptr) {
+            bool wasActive = *(bool *)((uintptr_t)mainSpecialInstance + 0x21);
             *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = true; // active
             *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true; // spShow
 
@@ -1124,7 +1152,8 @@ static void applyFreezeSpecialState(bool enable) {
                 lw_set_Value(epi, 100.0f);
             }
 
-            if (Main_Special_bzm != nullptr) {
+            // Only trigger ActivateSpecial audio/animation if not already active!
+            if (!wasActive && Main_Special_bzm != nullptr) {
                 Main_Special_bzm(mainSpecialInstance);
             }
         }
@@ -1143,8 +1172,10 @@ static void applyFreezeSpecialState(bool enable) {
             *(int32_t *)((uintptr_t)mainMultiplierInstance + 0x28) = 8;
         }
     } else {
+        g_specialActivatedForSong = false;
         if (mainSpecialInstance != nullptr) {
             *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = false;
+            *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = false;
         }
         if (mainMultiplierInstance != nullptr) {
             if (old_Main_Multiplier_Special != nullptr) {
