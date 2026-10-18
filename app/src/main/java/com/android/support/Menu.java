@@ -122,6 +122,8 @@ public class Menu {
 
     public static native int[] GetNoteStats();
 
+    native String GetRankingInfo();
+
     //Here we write the code for our Menu
     // Reference: https://www.androidhive.info/2016/11/android-floating-widget-like-facebook-chat-head/
     public Menu(Context context) {
@@ -642,9 +644,45 @@ public class Menu {
         button.setAllCaps(false); //Disable caps to support html
         button.setText(Html.fromHtml(featName));
         button.setBackgroundColor(BTN_COLOR);
+
+        final TextView specialHitView;
+        if (featNum == 15) {
+            specialHitView = new TextView(getContext);
+            LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT);
+            textParams.setMargins(7, 2, 7, 6);
+            specialHitView.setLayoutParams(textParams);
+            specialHitView.setTextColor(TEXT_COLOR_2);
+            specialHitView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            specialHitView.setPadding(dp(8), dp(6), dp(8), dp(6));
+            GradientDrawable gdInfoBox = new GradientDrawable();
+            gdInfoBox.setCornerRadius(dp(4));
+            gdInfoBox.setColor(Color.parseColor("#141D24"));
+            gdInfoBox.setStroke(1, Color.parseColor("#32465A"));
+            specialHitView.setBackground(gdInfoBox);
+            specialHitView.setTextIsSelectable(true);
+            specialHitView.setVisibility(View.GONE);
+        } else {
+            specialHitView = null;
+        }
+
         button.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 switch (featNum) {
+
+                    case 15:
+                        Preferences.changeFeatureInt(featName, featNum, 0);
+                        if (specialHitView != null) {
+                            try {
+                                String info = GetRankingInfo();
+                                if (info != null && !info.isEmpty()) {
+                                    specialHitView.setText(Html.fromHtml(info));
+                                    specialHitView.setVisibility(View.VISIBLE);
+                                }
+                            } catch (Exception e) {
+                                Log.e(TAG, "Error GetRankingInfo: " + e.getMessage());
+                            }
+                        }
+                        return;
 
                     case -6:
                         scrollView.removeView(mSettings);
@@ -667,6 +705,9 @@ public class Menu {
         });
 
         linLayout.addView(button);
+        if (specialHitView != null) {
+            linLayout.addView(specialHitView);
+        }
     }
 
     private void ButtonLink(LinearLayout linLayout, final String featName, final String url) {

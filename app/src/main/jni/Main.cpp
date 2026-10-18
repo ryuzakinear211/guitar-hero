@@ -2432,7 +2432,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("12_Toggle_Enable Set Score"),
             OBFUSCATE("13_InputValue_Target Score"),
             OBFUSCATE("14_Button_Reset Target Score"),
-            OBFUSCATE("15_Button_Check Ranking Score (Toast)"),
+            OBFUSCATE("15_Button_Check Ranking Score"),
 
             OBFUSCATE("Category_🎵 Songs & Unlocks"),
             OBFUSCATE("20_Toggle_Unlock All Songs"),
@@ -2445,7 +2445,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran (100% FC).<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎯 Set Score: Fitur mandiri, kunci score sesuai input target.<br>🏆 Check Ranking: Cek All-Time top score, song best score, & rute optimal special power.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran (100% FC).<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎯 Set Score: Fitur mandiri, kunci score sesuai input target.<br>🏆 Check Ranking: Cek All-Time top score, song best score, & rute optimal special power langsung di menu.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -2457,6 +2457,102 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
 
     return (ret);
+}
+
+static std::string GetRankingInfoInternal() {
+    int32_t topScore = 0;
+    int32_t songBestScore = 0;
+    std::string topPlayer = "";
+    int32_t targetSongId = g_activeSongId;
+
+    if (targetSongId <= 0 && g_menuMusRankingInstance != nullptr) {
+        int32_t rankSongId = *(int32_t *)((uintptr_t)g_menuMusRankingInstance + 0x2c);
+        if (rankSongId > 0) targetSongId = rankSongId;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_topScoreMutex);
+        if (targetSongId > 0) {
+            auto it = g_songTopScores.find(targetSongId);
+            if (it != g_songTopScores.end() && it->second.hasData) {
+                topScore = it->second.topScore;
+                songBestScore = it->second.songBestScore;
+                topPlayer = it->second.playerName;
+            }
+        }
+        if (topScore == 0 && g_currentTopChartScore.hasData) {
+            topScore = g_currentTopChartScore.topScore;
+            if (songBestScore == 0) songBestScore = g_currentTopChartScore.songBestScore;
+            topPlayer = g_currentTopChartScore.playerName;
+        }
+    }
+
+    // Fallback: Scan disk cache if not yet loaded into memory
+    if (topScore == 0) {
+        topScore = ScanDiskForTopScore(targetSongId, topPlayer);
+        if (topScore > 0 && targetSongId > 0) {
+            UpdateTopChartScore(targetSongId, topScore, topPlayer, 2);
+        }
+    }
+
+    // Calculate chart max score if active chart instance matches or is available
+    if (songBestScore == 0 && g_chartInstance != nullptr) {
+        songBestScore = CalculateChartMaxScore(g_chartInstance);
+    }
+
+    if (songBestScore == 0 && topScore > 0) {
+        songBestScore = topScore;
+    } else if (topScore > songBestScore) {
+        songBestScore = topScore;
+    }
+
+    // Automatically synchronize Target Score to follow the highest score between topScore and songBestScore
+    int32_t highestScore = std::max(topScore, songBestScore);
+    if (highestScore > 0) {
+        g_targetScore = highestScore;
+        g_customTargetScore = false;
+        g_setScoreEnabled = true;
+        LogDebug("[TopChartScore] GetRankingInfo sync: g_targetScore set to %d (top=%d, best=%d, player='%s', Song ID: %d)",
+                 highestScore, topScore, songBestScore, topPlayer.c_str(), targetSongId);
+    } else {
+        LogDebug("[TopChartScore] GetRankingInfo: No score available yet for Song ID %d", targetSongId);
+    }
+
+    // Calculate optimal special power activation route (note hit numbers)
+    std::string specialRoute = CalculateOptimalSpecialHits(g_chartInstance, topScore, songBestScore);
+    {
+        std::lock_guard<std::mutex> lock(g_rankingRecordMutex);
+        if (g_lastRankingRecord.hasData && !g_lastRankingRecord.spSequence.empty() &&
+            (targetSongId <= 0 || g_lastRankingRecord.songId == targetSongId)) {
+            specialRoute = g_lastRankingRecord.spSequence;
+        }
+    }
+
+    if (specialRoute.empty()) {
+        specialRoute = "-";
+    }
+
+    char rankingMsg[1024];
+    if (!topPlayer.empty()) {
+        snprintf(rankingMsg, sizeof(rankingMsg),
+                 "<font color='#00E5FF'><b>top score:</b></font> %d <small>(%s)</small><br><font color='#FFD700'><b>song best:</b></font> %d<br><font color='#FF6EC7'><b>sepcial hit:</b></font> %s",
+                 topScore, topPlayer.c_str(), songBestScore, specialRoute.c_str());
+    } else {
+        snprintf(rankingMsg, sizeof(rankingMsg),
+                 "<font color='#00E5FF'><b>top score:</b></font> %d<br><font color='#FFD700'><b>song best:</b></font> %d<br><font color='#FF6EC7'><b>sepcial hit:</b></font> %s",
+                 topScore, songBestScore, specialRoute.c_str());
+    }
+    return std::string(rankingMsg);
+}
+
+jstring GetRankingInfo(JNIEnv *env, jobject thiz) {
+    std::string info = GetRankingInfoInternal();
+    return env->NewStringUTF(info.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_android_support_Menu_GetRankingInfo(JNIEnv *env, jobject thiz) {
+    return GetRankingInfo(env, thiz);
 }
 
 void Changes(JNIEnv *env, jclass clazz, jobject obj,
@@ -2538,82 +2634,10 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             break;
         }
 
-        // Button: Check Ranking Score (Toast) (featNum 15)
+        // Button: Check Ranking Score (featNum 15)
         case 15: {
-            int32_t topScore = 0;
-            int32_t songBestScore = 0;
-            std::string topPlayer = "";
-            int32_t targetSongId = g_activeSongId;
-
-            if (targetSongId <= 0 && g_menuMusRankingInstance != nullptr) {
-                int32_t rankSongId = *(int32_t *)((uintptr_t)g_menuMusRankingInstance + 0x2c);
-                if (rankSongId > 0) targetSongId = rankSongId;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(g_topScoreMutex);
-                if (targetSongId > 0) {
-                    auto it = g_songTopScores.find(targetSongId);
-                    if (it != g_songTopScores.end() && it->second.hasData) {
-                        topScore = it->second.topScore;
-                        songBestScore = it->second.songBestScore;
-                        topPlayer = it->second.playerName;
-                    }
-                }
-                if (topScore == 0 && g_currentTopChartScore.hasData) {
-                    topScore = g_currentTopChartScore.topScore;
-                    if (songBestScore == 0) songBestScore = g_currentTopChartScore.songBestScore;
-                    topPlayer = g_currentTopChartScore.playerName;
-                }
-            }
-
-            // Fallback: Scan disk cache if not yet loaded into memory
-            if (topScore == 0) {
-                topScore = ScanDiskForTopScore(targetSongId, topPlayer);
-                if (topScore > 0 && targetSongId > 0) {
-                    UpdateTopChartScore(targetSongId, topScore, topPlayer, 2);
-                }
-            }
-
-            // Calculate chart max score if active chart instance matches or is available
-            if (songBestScore == 0 && g_chartInstance != nullptr) {
-                songBestScore = CalculateChartMaxScore(g_chartInstance);
-            }
-
-            // If song best score is still unknown or lower than top score, it should be at least top score
-            if (songBestScore == 0 && topScore > 0) {
-                songBestScore = topScore;
-            } else if (topScore > songBestScore) {
-                songBestScore = topScore;
-            }
-
-            // Automatically synchronize Target Score to follow the highest score between topScore and songBestScore
-            int32_t highestScore = std::max(topScore, songBestScore);
-            if (highestScore > 0) {
-                g_targetScore = highestScore;
-                g_customTargetScore = false;
-                g_setScoreEnabled = true;
-                LogDebug("[TopChartScore] Button 15 sync: g_targetScore set to %d (top=%d, best=%d, player='%s', Song ID: %d)",
-                         highestScore, topScore, songBestScore, topPlayer.c_str(), targetSongId);
-            } else {
-                LogDebug("[TopChartScore] Button 15: No score available yet for Song ID %d", targetSongId);
-            }
-
-            // Calculate optimal special power activation route (note hit numbers)
-            std::string specialRoute = CalculateOptimalSpecialHits(g_chartInstance, topScore, songBestScore);
-            {
-                std::lock_guard<std::mutex> lock(g_rankingRecordMutex);
-                if (g_lastRankingRecord.hasData && !g_lastRankingRecord.spSequence.empty() &&
-                    (targetSongId <= 0 || g_lastRankingRecord.songId == targetSongId)) {
-                    specialRoute = g_lastRankingRecord.spSequence;
-                }
-            }
-
-            char rankingMsg[256];
-            snprintf(rankingMsg, sizeof(rankingMsg), "top score: %d | song best: %d\nsepcial hit: %s",
-                     topScore, songBestScore, specialRoute.c_str());
-            LogDebug("User clicked Check Ranking Score:\n%s", rankingMsg);
-            Toast(env, obj, rankingMsg, ToastLength::LENGTH_LONG);
+            std::string rankingMsg = GetRankingInfoInternal();
+            LogDebug("User clicked Check Ranking Score: %s", rankingMsg.c_str());
             break;
         }
 
@@ -2708,6 +2732,7 @@ int RegisterMenu(JNIEnv *env) {
             {OBFUSCATE("SettingsList"),  OBFUSCATE("()[Ljava/lang/String;"), reinterpret_cast<void *>(SettingsList)},
             {OBFUSCATE("GetFeatureList"),  OBFUSCATE("()[Ljava/lang/String;"), reinterpret_cast<void *>(GetFeatureList)},
             {OBFUSCATE("GetNoteStats"),  OBFUSCATE("()[I"), reinterpret_cast<void *>(GetNoteStats)},
+            {OBFUSCATE("GetRankingInfo"), OBFUSCATE("()Ljava/lang/String;"), reinterpret_cast<void *>(GetRankingInfo)},
     };
 
     jclass clazz = env->FindClass(OBFUSCATE("com/android/support/Menu"));
