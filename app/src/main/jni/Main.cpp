@@ -1917,13 +1917,13 @@ void hook_lk_cxm(void *instance, void *songScoreInfo, bool b) {
     }
 }
 
+static std::atomic<bool> g_isRankingOpening{false};
+
 // 28. Hook MenuMus_Ranking::Open (RVA: 0x20e4454) - Song ranking dialog launcher
 void (*old_MenuMus_Ranking_Open)(void *instance, void *listaSong) = nullptr;
 void hook_MenuMus_Ranking_Open(void *instance, void *listaSong) {
     if (instance != nullptr && (uintptr_t)instance > 0x10000) {
         g_menuMusRankingInstance = instance;
-        // Pre-emptively set MenuMus_Ranking.eux (0x28) to RankType::songAll (2 = All-Time)
-        *(int32_t *)((uintptr_t)instance + 0x28) = 2;
     }
     if (listaSong != nullptr && (uintptr_t)listaSong > 0x10000) {
         int32_t sId = *(int32_t *)((uintptr_t)listaSong + 0x10);
@@ -1952,23 +1952,36 @@ void hook_MenuMus_Ranking_Open(void *instance, void *listaSong) {
         }
     }
     if (old_MenuMus_Ranking_Open != nullptr) {
+        g_isRankingOpening = true;
         old_MenuMus_Ranking_Open(instance, listaSong);
+        g_isRankingOpening = false;
     }
 }
 
-// 29. Hook MenuMus_Ranking::clh (RVA: 0x20ec458) - Ranking coroutine launcher (Forces All-Time Category)
+// 29. Hook MenuMus_Ranking::clh (RVA: 0x20ec458) - Ranking coroutine launcher
 void *(*old_MenuMus_Ranking_clh)(void *instance, int32_t a, int32_t b, bool c, bool d) = nullptr;
 void *hook_MenuMus_Ranking_clh(void *instance, int32_t a, int32_t b, bool c, bool d) {
-    // b is RankType: 0 = songMonth, 1 = songFriends, 2 = songAll, 3 = general
-    // Force to 2 (RankType::songAll = All-Time) to always pull All-Time top record
-    int32_t forcedType = 2; // RankType::songAll
-    LogDebug("[Ranking] MenuMus_Ranking::clh: Forcing RankType from %d to %d (All-Time) for Song ID %d",
-             b, forcedType, a);
-    if (instance != nullptr && (uintptr_t)instance > 0x10000) {
-        *(int32_t *)((uintptr_t)instance + 0x28) = forcedType;
+    int32_t rankTypeToUse = b;
+
+    if (g_isRankingOpening.load()) {
+        // Initial dialog open from MenuMus_Ranking::Open():
+        // Override default Monthly (0) to All-Time (2) so the highest chart record is pulled automatically
+        rankTypeToUse = 2; // RankType::songAll (All-Time)
+        LogDebug("[Ranking] Initial Open: Defaulting to All-Time category (2) for Song ID %d", a);
+        if (instance != nullptr && (uintptr_t)instance > 0x10000) {
+            *(int32_t *)((uintptr_t)instance + 0x28) = 2; // MenuMus_Ranking.eux = songAll
+        }
+    } else {
+        // User explicitly clicked a tab button (Monthly=0, Friends=1, All=2, Reload):
+        // Respect user's selection and do NOT force All-Time!
+        LogDebug("[Ranking] User tab switch: Requesting category %d for Song ID %d", b, a);
+        if (instance != nullptr && (uintptr_t)instance > 0x10000) {
+            *(int32_t *)((uintptr_t)instance + 0x28) = b; // Keep selected category in MenuMus_Ranking.eux
+        }
     }
+
     if (old_MenuMus_Ranking_clh != nullptr) {
-        return old_MenuMus_Ranking_clh(instance, a, forcedType, c, d);
+        return old_MenuMus_Ranking_clh(instance, a, rankTypeToUse, c, d);
     }
     return nullptr;
 }
@@ -1976,14 +1989,6 @@ void *hook_MenuMus_Ranking_clh(void *instance, int32_t a, int32_t b, bool c, boo
 // 30. Hook jw::MoveNext (RVA: 0x20ed1ac) - Ranking leaderboard parser coroutine
 bool (*old_jw_MoveNext)(void *instance) = nullptr;
 bool hook_jw_MoveNext(void *instance) {
-    // Ensure coroutine is querying All-Time ranking
-    if (instance != nullptr && (uintptr_t)instance > 0x10000) {
-        int32_t curTipo = *(int32_t *)((uintptr_t)instance + 0x28);
-        if (curTipo != 2) {
-            *(int32_t *)((uintptr_t)instance + 0x28) = 2; // Force RankType.songAll (2)
-        }
-    }
-
     bool result = false;
     if (old_jw_MoveNext != nullptr) {
         result = old_jw_MoveNext(instance);
@@ -2020,7 +2025,22 @@ bool hook_jw_MoveNext(void *instance) {
                 }
 
                 if (topPts > 0) {
-                    UpdateTopChartScore(idMusica, topPts, topPlayer, tipo);
+                    // If this is All-Time ranking (tipo == 2), always update topScore
+                    // If this is Monthly/Friends, do not overwrite an existing All-Time topScore
+                    bool shouldUpdate = false;
+                    if (tipo == 2) {
+                        shouldUpdate = true;
+                    } else {
+                        std::lock_guard<std::mutex> lock(g_topScoreMutex);
+                        auto it = g_songTopScores.find(idMusica);
+                        if (it == g_songTopScores.end() || !it->second.hasData || it->second.rankType != 2) {
+                            shouldUpdate = true;
+                        }
+                    }
+
+                    if (shouldUpdate) {
+                        UpdateTopChartScore(idMusica, topPts, topPlayer, tipo);
+                    }
                 }
             }
         }
