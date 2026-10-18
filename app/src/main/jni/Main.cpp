@@ -157,7 +157,7 @@ static void *mainMultiplierInstance = nullptr; // Pointer to Main_Multiplier
 
 // Freeze Special Feature State (Single Toggle, OFF by default)
 static std::atomic<bool> g_freezeSpecial{false};
-static std::atomic<bool> g_specialActivatedForSong{false};
+static std::atomic<bool> g_appliedFreezeSpecial{false};
 static float g_frozenSpecialSongTime = -1.0f;
 static void applyFreezeSpecialState(bool enable, bool force = false);
 
@@ -602,7 +602,7 @@ void hook_Main_Notes_byv(void *instance) {
     g_currentScore = 0;
     g_scoreFrozen = false;
     g_frozenSpecialSongTime = -1.0f;
-    g_specialActivatedForSong = false;
+    g_appliedFreezeSpecial = false;
     mainSpecialInstance = nullptr;
     mainMultiplierInstance = nullptr;
 
@@ -845,25 +845,27 @@ void hook_Main_Update(void *instance) {
         }
     }
 
-    // Continually ensure Freeze Special & x8 multiplier lock during active gameplay
-    bool freezeSpecialActive = g_freezeSpecial.load() || (g_autoPlay.load() && g_targetScore.load() > 0);
-    if (freezeSpecialActive) {
-        if (!g_specialActivatedForSong.exchange(true)) {
-            // First frame with active instances in this song: activate special once!
-            applyFreezeSpecialState(true, true);
-        } else {
-            // Per-frame silent lock: directly maintain memory fields without audio/log overhead!
-            if (mainSpecialInstance != nullptr) {
-                *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = true; // active
-                *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true; // spShow
+    // Continually manage Freeze Special state transitions and per-frame lock on the Unity Main Thread
+    bool desiredFreezeSpecial = g_freezeSpecial.load();
+    if (mainMultiplierInstance != nullptr && mainSpecialInstance != nullptr) {
+        if (g_appliedFreezeSpecial.load() != desiredFreezeSpecial) {
+            g_appliedFreezeSpecial = desiredFreezeSpecial;
+            applyFreezeSpecialState(desiredFreezeSpecial, true);
+        }
+    }
+
+    if (desiredFreezeSpecial) {
+        // Per-frame silent lock: directly maintain memory fields without audio/log overhead!
+        if (mainSpecialInstance != nullptr && (uintptr_t)mainSpecialInstance > 0x10000) {
+            *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = true; // active
+            *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true; // spShow
+        }
+        if (mainMultiplierInstance != nullptr && (uintptr_t)mainMultiplierInstance > 0x10000) {
+            void *erh = *(void **)((uintptr_t)mainMultiplierInstance + 0x20);
+            if (erh != nullptr && (uintptr_t)erh > 0x10000 && lx_set_Value != nullptr) {
+                lx_set_Value(erh, 8);
             }
-            if (mainMultiplierInstance != nullptr) {
-                void *erh = *(void **)((uintptr_t)mainMultiplierInstance + 0x20);
-                if (erh != nullptr && lx_set_Value != nullptr) {
-                    lx_set_Value(erh, 8);
-                }
-                *(int32_t *)((uintptr_t)mainMultiplierInstance + 0x28) = 8;
-            }
+            *(int32_t *)((uintptr_t)mainMultiplierInstance + 0x28) = 8;
         }
     }
 
@@ -1138,17 +1140,17 @@ static void applyFreezeSpecialState(bool enable, bool force) {
     LogDebug("[FreezeSpecial] State changed: %s", enable ? "ENABLED (x8 Locked)" : "DISABLED");
 
     if (enable) {
-        if (mainSpecialInstance != nullptr) {
+        if (mainSpecialInstance != nullptr && (uintptr_t)mainSpecialInstance > 0x10000) {
             bool wasActive = *(bool *)((uintptr_t)mainSpecialInstance + 0x21);
             *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = true; // active
             *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true; // spShow
 
             void *eph = *(void **)((uintptr_t)mainSpecialInstance + 0x58);
-            if (eph != nullptr && lw_set_Value != nullptr) {
+            if (eph != nullptr && (uintptr_t)eph > 0x10000 && lw_set_Value != nullptr) {
                 lw_set_Value(eph, 100.0f);
             }
             void *epi = *(void **)((uintptr_t)mainSpecialInstance + 0x60);
-            if (epi != nullptr && lw_set_Value != nullptr) {
+            if (epi != nullptr && (uintptr_t)epi > 0x10000 && lw_set_Value != nullptr) {
                 lw_set_Value(epi, 100.0f);
             }
 
@@ -1158,7 +1160,7 @@ static void applyFreezeSpecialState(bool enable, bool force) {
             }
         }
 
-        if (mainMultiplierInstance != nullptr) {
+        if (mainMultiplierInstance != nullptr && (uintptr_t)mainMultiplierInstance > 0x10000) {
             if (old_Main_Multiplier_Special != nullptr) {
                 old_Main_Multiplier_Special(mainMultiplierInstance, true);
             }
@@ -1166,18 +1168,17 @@ static void applyFreezeSpecialState(bool enable, bool force) {
                 old_Main_Multiplier_cch(mainMultiplierInstance, 30, true);
             }
             void *erh = *(void **)((uintptr_t)mainMultiplierInstance + 0x20);
-            if (erh != nullptr && lx_set_Value != nullptr) {
+            if (erh != nullptr && (uintptr_t)erh > 0x10000 && lx_set_Value != nullptr) {
                 lx_set_Value(erh, 8);
             }
             *(int32_t *)((uintptr_t)mainMultiplierInstance + 0x28) = 8;
         }
     } else {
-        g_specialActivatedForSong = false;
-        if (mainSpecialInstance != nullptr) {
+        if (mainSpecialInstance != nullptr && (uintptr_t)mainSpecialInstance > 0x10000) {
             *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = false;
             *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = false;
         }
-        if (mainMultiplierInstance != nullptr) {
+        if (mainMultiplierInstance != nullptr && (uintptr_t)mainMultiplierInstance > 0x10000) {
             if (old_Main_Multiplier_Special != nullptr) {
                 old_Main_Multiplier_Special(mainMultiplierInstance, false);
             }
@@ -1506,7 +1507,7 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
 
         // Freeze Special Feature (OFF by default)
         case 11:
-            applyFreezeSpecialState(boolean);
+            g_freezeSpecial = boolean;
             LogDebug("Freeze Special toggled: %d", boolean);
             Toast(env, obj, boolean ? OBFUSCATE("❄️ Freeze Special: AKTIF (x8 Multiplier)") : OBFUSCATE("❄️ Freeze Special: NONAKTIF"), ToastLength::LENGTH_SHORT);
             break;
@@ -1516,7 +1517,7 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             g_targetScore = value;
             if (value > 0) {
                 g_scoreFrozen = false;
-                applyFreezeSpecialState(true);
+                g_freezeSpecial = true;
                 char targetMsg[128];
                 snprintf(targetMsg, sizeof(targetMsg), "🎯 Target Score: %d (Freeze x8 Aktif)", value);
                 LogDebug("Target Score set: %d", value);
