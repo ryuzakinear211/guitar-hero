@@ -1225,9 +1225,8 @@ void hook_Main_ceq(void *instance) {
 
         if (g_autoPlay.load() || (perdidas == 0 && hits > 0)) {
             if (totalChart > hits) {
-                *(int32_t *)((uintptr_t)mainNotesInstance + 0x64) = totalChart; // acertadas
-                *(int32_t *)((uintptr_t)mainNotesInstance + 0x74) = totalChart; // combo
-                *(int32_t *)((uintptr_t)mainNotesInstance + 0x78) = totalChart; // maiorCombo
+                *(int32_t *)((uintptr_t)mainNotesInstance + 0x60) = totalChart; // comboMax (0x60)
+                *(int32_t *)((uintptr_t)mainNotesInstance + 0x64) = totalChart; // acertadas (0x64)
             }
             *(int32_t *)((uintptr_t)mainNotesInstance + 0x6c) = 0; // erradas = 0
             *(int32_t *)((uintptr_t)mainNotesInstance + 0x70) = 0; // perdidas = 0
@@ -1317,6 +1316,99 @@ void hook_jd_cey(void *instance, void *songScoreInfo, void *finalScreen, bool c)
 
     if (old_jd_cey != nullptr) {
         old_jd_cey(instance, songScoreInfo, finalScreen, c);
+    }
+}
+
+// 25. Hook lk::cxq (RVA: 0x210b7f0) - Anti-cheat score calculation validator
+bool (*old_lk_cxq)(void *instance, void *songScoreInfo) = nullptr;
+bool hook_lk_cxq(void *instance, void *songScoreInfo) {
+    if (g_setScoreEnabled.load() && g_targetScore.load() > 0) {
+        LogDebug("[SetScore] lk::cxq: Bypassing score calculation validation for target score %d", g_targetScore.load());
+        return true;
+    }
+    if (old_lk_cxq != nullptr) {
+        return old_lk_cxq(instance, songScoreInfo);
+    }
+    return true;
+}
+
+// 26. Hook lk::cxt (RVA: 0x210b99c) - Previous best score getter
+int32_t (*old_lk_cxt)(void *instance, int32_t a, void *b) = nullptr;
+int32_t hook_lk_cxt(void *instance, int32_t a, void *b) {
+    if (g_setScoreEnabled.load() && g_targetScore.load() > 0) {
+        // Return 0 so that cxm ALWAYS treats target score as a new high score record
+        // and guarantees that score is saved both locally and submitted to online ranking!
+        LogDebug("[SetScore] lk::cxt: Returning 0 so target score %d is always saved as new record", g_targetScore.load());
+        return 0;
+    }
+    if (old_lk_cxt != nullptr) {
+        return old_lk_cxt(instance, a, b);
+    }
+    return 0;
+}
+
+// Function pointer for lk::cxn (RVA: 0x210c18c) - Direct ranking submission
+static void (*lk_cxn)(void *instance, void *songScoreInfo) = nullptr;
+
+// 27. Hook lk::cxm (RVA: 0x210b4f8) - Main score saving & ranking submission coordinator
+void (*old_lk_cxm)(void *instance, void *songScoreInfo, bool b) = nullptr;
+void hook_lk_cxm(void *instance, void *songScoreInfo, bool b) {
+    if (songScoreInfo != nullptr) {
+        if (g_setScoreEnabled.load() && g_targetScore.load() > 0) {
+            int32_t target = g_targetScore.load();
+            void *pts_lx = *(void **)((uintptr_t)songScoreInfo + 0x20);
+            if (pts_lx != nullptr && lx_set_Value != nullptr) {
+                lx_set_Value(pts_lx, target);
+                LogDebug("[SetScore] lk::cxm: pts forced to %d", target);
+            }
+            g_currentScore = target;
+            g_scoreFrozen = true;
+
+            int32_t acertadas = *(int32_t *)((uintptr_t)songScoreInfo + 0x30);
+            if (acertadas > 0) {
+                int32_t currentSP = *(int32_t *)((uintptr_t)songScoreInfo + 0x34);
+                if (target > 20 * acertadas) {
+                    int32_t neededSP = (target - 20 * acertadas) / 20 + 1;
+                    if (neededSP > acertadas) neededSP = acertadas;
+                    if (neededSP > currentSP) {
+                        *(int32_t *)((uintptr_t)songScoreInfo + 0x34) = neededSP;
+                    }
+                    float neededRastros = (float)(target - (40 * neededSP + 20 * (acertadas - neededSP)) + 500);
+                    if (neededRastros > *(float *)((uintptr_t)songScoreInfo + 0x40)) {
+                        *(float *)((uintptr_t)songScoreInfo + 0x40) = neededRastros;
+                    }
+                }
+            }
+        }
+
+        // 100% FC / Accuracy Fix for Result Screen & Ranking
+        int32_t acertadas = *(int32_t *)((uintptr_t)songScoreInfo + 0x30);
+        int32_t perdidas = *(int32_t *)((uintptr_t)songScoreInfo + 0x3c);
+        int32_t combo = *(int32_t *)((uintptr_t)songScoreInfo + 0x28);
+        int32_t totalChart = (g_chartInstance != nullptr && ed_Count != nullptr) ? ed_Count(g_chartInstance) : acertadas;
+
+        if (g_autoPlay.load() || (perdidas == 0 && acertadas > 0)) {
+            if (totalChart > acertadas) acertadas = totalChart;
+            if (totalChart > combo) combo = totalChart;
+
+            *(int32_t *)((uintptr_t)songScoreInfo + 0x30) = acertadas;
+            *(int32_t *)((uintptr_t)songScoreInfo + 0x28) = combo;
+            *(int32_t *)((uintptr_t)songScoreInfo + 0x38) = 0;
+            *(int32_t *)((uintptr_t)songScoreInfo + 0x3c) = 0;
+            *(int32_t *)((uintptr_t)songScoreInfo + 0x2c) = 100;
+        }
+    }
+
+    if (old_lk_cxm != nullptr) {
+        old_lk_cxm(instance, songScoreInfo, b);
+    }
+
+    // Safety net: If Set Score is active, make sure lk_cxn was triggered
+    if (g_setScoreEnabled.load() && g_targetScore.load() > 0 && instance != nullptr && songScoreInfo != nullptr) {
+        if (lk_cxn != nullptr) {
+            LogDebug("[SetScore] Submitting score %d to ranking server via lk_cxn", g_targetScore.load());
+            lk_cxn(instance, songScoreInfo);
+        }
     }
 }
 
@@ -1462,6 +1554,22 @@ void *hack_thread(void *) {
     // 24. Hook jd::cey (0x20e18a4) - Score saving handler
     HOOK("0x20e18a4", hook_jd_cey, old_jd_cey);
     LogDebug("Hook jd::cey (0x20e18a4): %s", old_jd_cey != nullptr ? "SUCCESS" : "FAILED");
+
+    // Resolve lk::cxn (0x210c18c) - Direct ranking submission
+    lk_cxn = reinterpret_cast<void (*)(void *, void *)>(base + 0x210c18c);
+    LogDebug("Resolve lk::cxn (0x210c18c): %s", lk_cxn != nullptr ? "SUCCESS" : "FAILED");
+
+    // 25. Hook lk::cxq (0x210b7f0) - Anti-cheat score calculation validator
+    HOOK("0x210b7f0", hook_lk_cxq, old_lk_cxq);
+    LogDebug("Hook lk::cxq (0x210b7f0): %s", old_lk_cxq != nullptr ? "SUCCESS" : "FAILED");
+
+    // 26. Hook lk::cxt (0x210b99c) - Previous best score getter
+    HOOK("0x210b99c", hook_lk_cxt, old_lk_cxt);
+    LogDebug("Hook lk::cxt (0x210b99c): %s", old_lk_cxt != nullptr ? "SUCCESS" : "FAILED");
+
+    // 27. Hook lk::cxm (0x210b4f8) - Main score saving & ranking submission
+    HOOK("0x210b4f8", hook_lk_cxm, old_lk_cxm);
+    LogDebug("Hook lk::cxm (0x210b4f8): %s", old_lk_cxm != nullptr ? "SUCCESS" : "FAILED");
 
     // Resolve AudioSource.get_clip & AudioClip.get_length for song duration inspection
     AudioSource_get_clip = reinterpret_cast<void *(*)(void *)>(base + 0x3c6f828);
