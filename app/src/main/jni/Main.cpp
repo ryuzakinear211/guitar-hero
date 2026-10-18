@@ -1944,86 +1944,24 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
 
         // Button: Check Ranking Score (Toast) (featNum 15)
         case 15: {
-            char rankingMsg[512];
-            std::lock_guard<std::mutex> lock(g_rankingRecordMutex);
-
-            if (g_lastRankingRecord.hasData) {
-                const char *modeTag = "";
-                if (g_lastRankingRecord.setScoreApplied) {
-                    modeTag = " [TARGET]";
-                } else if (g_lastRankingRecord.autoPlayUsed) {
-                    modeTag = " [100% FC]";
+            int32_t score = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_rankingRecordMutex);
+                if (g_isSongActive && g_currentScore.load() > 0) {
+                    score = g_currentScore.load();
+                } else if (g_lastRankingRecord.hasData) {
+                    score = g_lastRankingRecord.score;
+                } else if (g_currentScore.load() > 0) {
+                    score = g_currentScore.load();
+                } else if (g_setScoreEnabled.load() && g_targetScore.load() > 0) {
+                    score = g_targetScore.load();
                 }
-
-                if (!g_lastRankingRecord.artist.empty()) {
-                    snprintf(rankingMsg, sizeof(rankingMsg),
-                             "🏆 SCORE RANKING RESMI:\n🎵 Lagu: %s\n🎤 Artis: %s (ID: %d)\n⭐ Diff: %s\n💎 Score: %d%s\n🎯 Akurasi: %d%% | 🔥 Combo: %d\n✅ Hit: %d | ❌ Miss: %d\n📡 Status: ✅ TERCATAT RESMI\n🕒 Waktu: %s (#%d)",
-                             g_lastRankingRecord.songTitle.c_str(),
-                             g_lastRankingRecord.artist.c_str(),
-                             g_lastRankingRecord.songId,
-                             g_lastRankingRecord.difficulty.c_str(),
-                             g_lastRankingRecord.score, modeTag,
-                             g_lastRankingRecord.accuracy,
-                             g_lastRankingRecord.combo,
-                             g_lastRankingRecord.hits,
-                             g_lastRankingRecord.misses,
-                             g_lastRankingRecord.recordTime.c_str(),
-                             g_totalRankingSubmissions);
-                } else {
-                    snprintf(rankingMsg, sizeof(rankingMsg),
-                             "🏆 SCORE RANKING RESMI:\n🎵 Lagu: %s (ID: %d)\n⭐ Diff: %s\n💎 Score: %d%s\n🎯 Akurasi: %d%% | 🔥 Combo: %d\n✅ Hit: %d | ❌ Miss: %d\n📡 Status: ✅ TERCATAT RESMI\n🕒 Waktu: %s (#%d)",
-                             g_lastRankingRecord.songTitle.c_str(),
-                             g_lastRankingRecord.songId,
-                             g_lastRankingRecord.difficulty.c_str(),
-                             g_lastRankingRecord.score, modeTag,
-                             g_lastRankingRecord.accuracy,
-                             g_lastRankingRecord.combo,
-                             g_lastRankingRecord.hits,
-                             g_lastRankingRecord.misses,
-                             g_lastRankingRecord.recordTime.c_str(),
-                             g_totalRankingSubmissions);
-                }
-
-                LogDebug("User clicked Check Ranking Score: Song='%s', ID=%d, Score=%d, Acc=%d%%, Time=%s",
-                         g_lastRankingRecord.songTitle.c_str(),
-                         g_lastRankingRecord.songId,
-                         g_lastRankingRecord.score,
-                         g_lastRankingRecord.accuracy,
-                         g_lastRankingRecord.recordTime.c_str());
-            } else if (g_isSongActive && g_activeSongId > 0) {
-                int32_t liveScore = g_currentScore.load();
-                int32_t targetScore = g_targetScore.load();
-                int32_t liveHit = getNotesHit();
-                int32_t liveCombo = g_currentCombo.load();
-
-                snprintf(rankingMsg, sizeof(rankingMsg),
-                         "🏆 SCORE RANKING (LIVE PLAY):\n🎵 Sedang Main: %s\n⭐ Diff: %s | ID: %d\n💎 Live Score: %d\n🎯 Target Score: %d (%s)\n🔥 Combo: %d | Hit: %d\n⏳ Status: Akan tercatat saat lagu selesai",
-                         g_activeSongTitle.empty() ? "Lagu Aktif" : g_activeSongTitle.c_str(),
-                         g_activeDifficulty.c_str(),
-                         g_activeSongId,
-                         liveScore,
-                         targetScore,
-                         g_setScoreEnabled.load() ? "AKTIF" : "NONAKTIF",
-                         liveCombo, liveHit);
-
-                LogDebug("User clicked Check Ranking Score during active song: ID=%d, Score=%d", g_activeSongId, liveScore);
-            } else {
-                int32_t target = g_targetScore.load();
-                bool setScoreOn = g_setScoreEnabled.load();
-
-                if (setScoreOn && target > 0) {
-                    snprintf(rankingMsg, sizeof(rankingMsg),
-                             "🏆 SCORE RANKING RESMI:\nℹ️ Belum ada score tercatat pada sesi ini.\n🎯 Set Score Siap: Target %d\nMainkan lagu sampai selesai untuk mencatat score resmi ke server ranking!",
-                             target);
-                } else {
-                    snprintf(rankingMsg, sizeof(rankingMsg),
-                             "🏆 SCORE RANKING RESMI:\nℹ️ Belum ada score tercatat pada sesi ini.\nMainkan lagu sampai selesai untuk mencatat score resmi ke server ranking!");
-                }
-
-                LogDebug("User clicked Check Ranking Score: No record yet (SetScore=%d, Target=%d)", setScoreOn ? 1 : 0, target);
             }
 
-            Toast(env, obj, rankingMsg, ToastLength::LENGTH_LONG);
+            char rankingMsg[64];
+            snprintf(rankingMsg, sizeof(rankingMsg), "Score: %d", score);
+            LogDebug("User clicked Check Ranking Score: %s", rankingMsg);
+            Toast(env, obj, rankingMsg, ToastLength::LENGTH_SHORT);
             break;
         }
 
