@@ -276,6 +276,7 @@ struct TopLeaderboardScore {
     bool hasData = false;
     int32_t songId = 0;
     int32_t topScore = 0;
+    int32_t songBestScore = 0;
     std::string playerName = "";
     int32_t rankType = 0;
     std::string recordTime = "";
@@ -300,10 +301,15 @@ static void UpdateTopChartScore(int32_t songId, int32_t score, const std::string
 
     {
         std::lock_guard<std::mutex> lock(g_topScoreMutex);
+        auto it = g_songTopScores.find(songId);
+        int32_t existingBest = (it != g_songTopScores.end()) ? it->second.songBestScore : 0;
+        int32_t bestScore = std::max(existingBest, score);
+
         TopLeaderboardScore entry;
         entry.hasData = true;
         entry.songId = songId;
         entry.topScore = score;
+        entry.songBestScore = bestScore;
         entry.playerName = playerName;
         entry.rankType = rankType;
         entry.recordTime = timeBuf;
@@ -313,15 +319,58 @@ static void UpdateTopChartScore(int32_t songId, int32_t score, const std::string
         // If this matches active song or if no active song is set yet, auto-sync target score
         if (songId == g_activeSongId || g_activeSongId == 0) {
             g_currentTopChartScore = entry;
-            g_targetScore = score;
+            int32_t targetToSet = std::max(entry.topScore, entry.songBestScore);
+            g_targetScore = targetToSet;
             g_setScoreEnabled = true;
-            LogDebug("[TopChartScore] Automatically updated g_targetScore = %d from Top #1 on chart (Song ID: %d, Player: '%s', Time: %s)",
-                     score, songId, playerName.c_str(), timeBuf);
+            LogDebug("[TopChartScore] Automatically updated g_targetScore = %d (top=%d, best=%d) from Top #1 on chart (Song ID: %d, Player: '%s', Time: %s)",
+                     targetToSet, score, bestScore, songId, playerName.c_str(), timeBuf);
         } else {
-            LogDebug("[TopChartScore] Cached Top #1 for Song ID %d: Score = %d (Player: '%s')",
-                     songId, score, playerName.c_str());
+            LogDebug("[TopChartScore] Cached Top #1 for Song ID %d: Top = %d, Best = %d (Player: '%s')",
+                     songId, score, bestScore, playerName.c_str());
         }
     }
+}
+
+// Function to calculate theoretical maximum score directly from the song chart (ed)
+static int32_t CalculateChartMaxScore(void *chartInstance) {
+    if (chartInstance == nullptr || (uintptr_t)chartInstance < 0x10000) return 0;
+
+    void *dya = *(void **)((uintptr_t)chartInstance + 0x20); // NoteChart[] dya
+    if (dya == nullptr || (uintptr_t)dya < 0x10000) return 0;
+
+    int32_t count = *(int32_t *)((uintptr_t)dya + 0x18);
+    if (count <= 0 || count > 20000) return 0;
+
+    int32_t spNotes = 0;
+    float totalSustainDuration = 0.0f;
+
+    for (int32_t i = 0; i < count; i++) {
+        void *nc = *(void **)((uintptr_t)dya + 0x20 + i * sizeof(void *));
+        if (nc == nullptr || (uintptr_t)nc < 0x10000) continue;
+
+        float dur = *(float *)((uintptr_t)nc + 0x18);
+        int32_t sp = *(int32_t *)((uintptr_t)nc + 0x1c);
+
+        if (dur > 0.0f && dur < 100.0f) {
+            totalSustainDuration += dur;
+        }
+        if (sp > 0) {
+            spNotes++;
+        }
+    }
+
+    // Upper bound calculation based on Guitar Flash scoring system and lk::cxq:
+    // With Star Power (or Freeze Special x8 multiplier active):
+    // Max note score: count * 40 points
+    // Max sustain score: duration * 50 points
+    // In lk::cxq: max_allowed = (acertadas - acertadasSP)*20 + acertadasSP*40 + rastros + 20
+    int32_t maxNoteScore = count * 40;
+    int32_t sustainPoints = (int32_t)(totalSustainDuration * 50.0f);
+    int32_t theoreticalMax = maxNoteScore + sustainPoints;
+
+    LogDebug("[ChartMaxScore] Calculated from chart: notes=%d, spNotes=%d, sustainDur=%.2f -> theoreticalMax=%d",
+             count, spNotes, totalSustainDuration, theoreticalMax);
+    return theoreticalMax;
 }
 
 static std::string GetAppPackageName() {
@@ -1117,16 +1166,39 @@ void hook_Main_Update(void *instance) {
                 LogDebug("[ActiveSong] Captured from Main.settings: ID=%d, Title='%s', Artist='%s', Diff='%s'",
                          sId, g_activeSongTitle.c_str(), g_activeSongArtist.c_str(), g_activeDifficulty.c_str());
 
-                // Automatically follow known top score for this song chart
+                // Calculate chart max score if chart instance is available
+                int32_t chartMax = 0;
+                if (g_chartInstance != nullptr) {
+                    chartMax = CalculateChartMaxScore(g_chartInstance);
+                }
+
+                // Automatically follow known top score / song best score for this song chart
                 {
                     std::lock_guard<std::mutex> lock(g_topScoreMutex);
                     auto it = g_songTopScores.find(sId);
-                    if (it != g_songTopScores.end() && it->second.hasData && it->second.topScore > 0) {
+                    if (it != g_songTopScores.end() && it->second.hasData) {
+                        if (chartMax > it->second.songBestScore) {
+                            it->second.songBestScore = chartMax;
+                        }
                         g_currentTopChartScore = it->second;
-                        g_targetScore = it->second.topScore;
+                        int32_t targetScore = std::max(it->second.topScore, it->second.songBestScore);
+                        if (targetScore > 0) {
+                            g_targetScore = targetScore;
+                            g_setScoreEnabled = true;
+                            LogDebug("[ActiveSong] Automatically synced target score = %d (top=%d, best=%d) for Song ID %d",
+                                     targetScore, it->second.topScore, it->second.songBestScore, sId);
+                        }
+                    } else if (chartMax > 0) {
+                        TopLeaderboardScore entry;
+                        entry.hasData = true;
+                        entry.songId = sId;
+                        entry.topScore = chartMax;
+                        entry.songBestScore = chartMax;
+                        g_songTopScores[sId] = entry;
+                        g_currentTopChartScore = entry;
+                        g_targetScore = chartMax;
                         g_setScoreEnabled = true;
-                        LogDebug("[ActiveSong] Automatically synced target score = %d from known top score for Song ID %d",
-                                 it->second.topScore, sId);
+                        LogDebug("[ActiveSong] Synced target score to chartMax = %d for Song ID %d", chartMax, sId);
                     }
                 }
             }
@@ -1325,12 +1397,15 @@ void hook_MenuMus_Setlist_cnn(void *setlist, int32_t a, bool b) {
             {
                 std::lock_guard<std::mutex> lock(g_topScoreMutex);
                 auto it = g_songTopScores.find(g_activeSongId);
-                if (it != g_songTopScores.end() && it->second.hasData && it->second.topScore > 0) {
-                    g_currentTopChartScore = it->second;
-                    g_targetScore = it->second.topScore;
-                    g_setScoreEnabled = true;
-                    LogDebug("[SetlistLaunch] Automatically synced target score = %d from known top score for Song ID %d",
-                             it->second.topScore, g_activeSongId);
+                if (it != g_songTopScores.end() && it->second.hasData) {
+                    int32_t targetScore = std::max(it->second.topScore, it->second.songBestScore);
+                    if (targetScore > 0) {
+                        g_currentTopChartScore = it->second;
+                        g_targetScore = targetScore;
+                        g_setScoreEnabled = true;
+                        LogDebug("[SetlistLaunch] Automatically synced target score = %d (top=%d, best=%d) for Song ID %d",
+                                 targetScore, it->second.topScore, it->second.songBestScore, g_activeSongId);
+                    }
                 }
             }
         }
@@ -1845,8 +1920,10 @@ void hook_lk_cxm(void *instance, void *songScoreInfo, bool b) {
 // 28. Hook MenuMus_Ranking::Open (RVA: 0x20e4454) - Song ranking dialog launcher
 void (*old_MenuMus_Ranking_Open)(void *instance, void *listaSong) = nullptr;
 void hook_MenuMus_Ranking_Open(void *instance, void *listaSong) {
-    if (instance != nullptr) {
+    if (instance != nullptr && (uintptr_t)instance > 0x10000) {
         g_menuMusRankingInstance = instance;
+        // Pre-emptively set MenuMus_Ranking.eux (0x28) to RankType::songAll (2 = All-Time)
+        *(int32_t *)((uintptr_t)instance + 0x28) = 2;
     }
     if (listaSong != nullptr && (uintptr_t)listaSong > 0x10000) {
         int32_t sId = *(int32_t *)((uintptr_t)listaSong + 0x10);
@@ -1862,12 +1939,15 @@ void hook_MenuMus_Ranking_Open(void *instance, void *listaSong) {
             // If we already know top score for this song, automatically set target score!
             std::lock_guard<std::mutex> lock(g_topScoreMutex);
             auto it = g_songTopScores.find(sId);
-            if (it != g_songTopScores.end() && it->second.hasData && it->second.topScore > 0) {
-                g_currentTopChartScore = it->second;
-                g_targetScore = it->second.topScore;
-                g_setScoreEnabled = true;
-                LogDebug("[RankingOpen] Automatically applied target score = %d from known top score for Song ID %d",
-                         it->second.topScore, sId);
+            if (it != g_songTopScores.end() && it->second.hasData) {
+                int32_t targetScore = std::max(it->second.topScore, it->second.songBestScore);
+                if (targetScore > 0) {
+                    g_currentTopChartScore = it->second;
+                    g_targetScore = targetScore;
+                    g_setScoreEnabled = true;
+                    LogDebug("[RankingOpen] Automatically applied target score = %d (top=%d, best=%d) from known scores for Song ID %d",
+                             targetScore, it->second.topScore, it->second.songBestScore, sId);
+                }
             }
         }
     }
@@ -1876,9 +1956,34 @@ void hook_MenuMus_Ranking_Open(void *instance, void *listaSong) {
     }
 }
 
-// 29. Hook jw::MoveNext (RVA: 0x20ed1ac) - Ranking leaderboard parser coroutine
+// 29. Hook MenuMus_Ranking::clh (RVA: 0x20ec458) - Ranking coroutine launcher (Forces All-Time Category)
+void *(*old_MenuMus_Ranking_clh)(void *instance, int32_t a, int32_t b, bool c, bool d) = nullptr;
+void *hook_MenuMus_Ranking_clh(void *instance, int32_t a, int32_t b, bool c, bool d) {
+    // b is RankType: 0 = songMonth, 1 = songFriends, 2 = songAll, 3 = general
+    // Force to 2 (RankType::songAll = All-Time) to always pull All-Time top record
+    int32_t forcedType = 2; // RankType::songAll
+    LogDebug("[Ranking] MenuMus_Ranking::clh: Forcing RankType from %d to %d (All-Time) for Song ID %d",
+             b, forcedType, a);
+    if (instance != nullptr && (uintptr_t)instance > 0x10000) {
+        *(int32_t *)((uintptr_t)instance + 0x28) = forcedType;
+    }
+    if (old_MenuMus_Ranking_clh != nullptr) {
+        return old_MenuMus_Ranking_clh(instance, a, forcedType, c, d);
+    }
+    return nullptr;
+}
+
+// 30. Hook jw::MoveNext (RVA: 0x20ed1ac) - Ranking leaderboard parser coroutine
 bool (*old_jw_MoveNext)(void *instance) = nullptr;
 bool hook_jw_MoveNext(void *instance) {
+    // Ensure coroutine is querying All-Time ranking
+    if (instance != nullptr && (uintptr_t)instance > 0x10000) {
+        int32_t curTipo = *(int32_t *)((uintptr_t)instance + 0x28);
+        if (curTipo != 2) {
+            *(int32_t *)((uintptr_t)instance + 0x28) = 2; // Force RankType.songAll (2)
+        }
+    }
+
     bool result = false;
     if (old_jw_MoveNext != nullptr) {
         result = old_jw_MoveNext(instance);
@@ -1922,6 +2027,20 @@ bool hook_jw_MoveNext(void *instance) {
     }
 
     return result;
+}
+
+// 31. Hook ed::bab (RVA: 0x1c31de0) - Chart loader
+void (*old_ed_bab)(void *instance, int32_t a, void *b, int32_t c, void *d, void *e) = nullptr;
+void hook_ed_bab(void *instance, int32_t a, void *b, int32_t c, void *d, void *e) {
+    if (instance != nullptr) {
+        g_chartInstance = instance;
+    }
+    if (a > 0) {
+        g_activeSongId = a;
+    }
+    if (old_ed_bab != nullptr) {
+        old_ed_bab(instance, a, b, c, d, e);
+    }
 }
 
 // Native Thread for Library Detection & Hooking
@@ -2087,9 +2206,17 @@ void *hack_thread(void *) {
     HOOK("0x20e4454", hook_MenuMus_Ranking_Open, old_MenuMus_Ranking_Open);
     LogDebug("Hook MenuMus_Ranking::Open (0x20e4454): %s", old_MenuMus_Ranking_Open != nullptr ? "SUCCESS" : "FAILED");
 
-    // 29. Hook jw::MoveNext (0x20ed1ac) - Ranking leaderboard parser coroutine
+    // 29. Hook MenuMus_Ranking::clh (0x20ec458) - Ranking coroutine launcher (Forces All-Time Category)
+    HOOK("0x20ec458", hook_MenuMus_Ranking_clh, old_MenuMus_Ranking_clh);
+    LogDebug("Hook MenuMus_Ranking::clh (0x20ec458): %s", old_MenuMus_Ranking_clh != nullptr ? "SUCCESS" : "FAILED");
+
+    // 30. Hook jw::MoveNext (0x20ed1ac) - Ranking leaderboard parser coroutine
     HOOK("0x20ed1ac", hook_jw_MoveNext, old_jw_MoveNext);
     LogDebug("Hook jw::MoveNext (0x20ed1ac): %s", old_jw_MoveNext != nullptr ? "SUCCESS" : "FAILED");
+
+    // 31. Hook ed::bab (0x1c31de0) - Chart loader
+    HOOK("0x1c31de0", hook_ed_bab, old_ed_bab);
+    LogDebug("Hook ed::bab (0x1c31de0): %s", old_ed_bab != nullptr ? "SUCCESS" : "FAILED");
 
     // Resolve AudioSource.get_clip & AudioClip.get_length for song duration inspection
     AudioSource_get_clip = reinterpret_cast<void *(*)(void *)>(base + 0x3c6f828);
@@ -2166,7 +2293,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran (100% FC).<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎯 Set Score: Fitur mandiri, kunci score sesuai input target.<br>🏆 Check Ranking: Cek dan sinkronkan target score ke top score (ranking 1) chart lagu.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran (100% FC).<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎯 Set Score: Fitur mandiri, kunci score sesuai input target.<br>🏆 Check Ranking: Cek & sinkronkan target score ke All-Time top score (ranking 1) & song best score.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -2256,20 +2383,28 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
         // Button: Check Ranking Score (Toast) (featNum 15)
         case 15: {
             int32_t topScore = 0;
+            int32_t songBestScore = 0;
             std::string topPlayer = "";
             int32_t targetSongId = g_activeSongId;
+
+            if (targetSongId <= 0 && g_menuMusRankingInstance != nullptr) {
+                int32_t rankSongId = *(int32_t *)((uintptr_t)g_menuMusRankingInstance + 0x2c);
+                if (rankSongId > 0) targetSongId = rankSongId;
+            }
 
             {
                 std::lock_guard<std::mutex> lock(g_topScoreMutex);
                 if (targetSongId > 0) {
                     auto it = g_songTopScores.find(targetSongId);
-                    if (it != g_songTopScores.end() && it->second.hasData && it->second.topScore > 0) {
+                    if (it != g_songTopScores.end() && it->second.hasData) {
                         topScore = it->second.topScore;
+                        songBestScore = it->second.songBestScore;
                         topPlayer = it->second.playerName;
                     }
                 }
-                if (topScore == 0 && g_currentTopChartScore.hasData && g_currentTopChartScore.topScore > 0) {
+                if (topScore == 0 && g_currentTopChartScore.hasData) {
                     topScore = g_currentTopChartScore.topScore;
+                    if (songBestScore == 0) songBestScore = g_currentTopChartScore.songBestScore;
                     topPlayer = g_currentTopChartScore.playerName;
                 }
             }
@@ -2278,23 +2413,46 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             if (topScore == 0) {
                 topScore = ScanDiskForTopScore(targetSongId, topPlayer);
                 if (topScore > 0 && targetSongId > 0) {
-                    UpdateTopChartScore(targetSongId, topScore, topPlayer, 0);
+                    UpdateTopChartScore(targetSongId, topScore, topPlayer, 2);
                 }
             }
 
-            // Automatically synchronize Target Score to follow the top score #1
-            if (topScore > 0) {
-                g_targetScore = topScore;
-                g_setScoreEnabled = true;
-                LogDebug("[TopChartScore] Button 15 sync: g_targetScore set to %d (Top 1 player: '%s', Song ID: %d)",
-                         topScore, topPlayer.c_str(), targetSongId);
-            } else {
-                LogDebug("[TopChartScore] Button 15: No top leaderboard score available yet for Song ID %d", targetSongId);
+            // Calculate chart max score if active chart instance matches or is available
+            if (songBestScore == 0 && g_chartInstance != nullptr) {
+                songBestScore = CalculateChartMaxScore(g_chartInstance);
             }
 
-            char rankingMsg[64];
-            snprintf(rankingMsg, sizeof(rankingMsg), "Score: %d", topScore);
-            LogDebug("User clicked Check Ranking Score: %s", rankingMsg);
+            // Also check saved personal best record for this song
+            {
+                std::lock_guard<std::mutex> lock(g_rankingRecordMutex);
+                if (g_lastRankingRecord.hasData && (targetSongId <= 0 || g_lastRankingRecord.songId == targetSongId)) {
+                    if (g_lastRankingRecord.score > songBestScore) {
+                        songBestScore = g_lastRankingRecord.score;
+                    }
+                }
+            }
+
+            // If song best score is still unknown or lower than top score, it should be at least top score
+            if (songBestScore == 0 && topScore > 0) {
+                songBestScore = topScore;
+            } else if (topScore > songBestScore) {
+                songBestScore = topScore;
+            }
+
+            // Automatically synchronize Target Score to follow the highest score between topScore and songBestScore
+            int32_t highestScore = std::max(topScore, songBestScore);
+            if (highestScore > 0) {
+                g_targetScore = highestScore;
+                g_setScoreEnabled = true;
+                LogDebug("[TopChartScore] Button 15 sync: g_targetScore set to %d (top=%d, best=%d, player='%s', Song ID: %d)",
+                         highestScore, topScore, songBestScore, topPlayer.c_str(), targetSongId);
+            } else {
+                LogDebug("[TopChartScore] Button 15: No score available yet for Song ID %d", targetSongId);
+            }
+
+            char rankingMsg[128];
+            snprintf(rankingMsg, sizeof(rankingMsg), "top score: %d\nsong best score: %d", topScore, songBestScore);
+            LogDebug("User clicked Check Ranking Score:\n%s", rankingMsg);
             Toast(env, obj, rankingMsg, ToastLength::LENGTH_SHORT);
             break;
         }
