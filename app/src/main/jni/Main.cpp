@@ -133,6 +133,13 @@ static void *mainNotesInstance = nullptr;   // Pointer to Main_Notes
 static void *mainScorerInstance = nullptr;  // Pointer to Main_Scorer
 static void *mainFretsInstance = nullptr;   // Pointer to Main_Frets
 static void *g_chartInstance = nullptr;     // Pointer to ed (Chart Manager)
+static void *mainSpecialInstance = nullptr; // Pointer to Main_Special
+static void *mainMultiplierInstance = nullptr; // Pointer to Main_Multiplier
+
+// Freeze Special Feature State (Single Toggle, OFF by default)
+static std::atomic<bool> g_freezeSpecial{false};
+static float g_frozenSpecialSongTime = -1.0f;
+static void applyFreezeSpecialState(bool enable);
 
 // Helper: Inspects active notes in Main_Notes::eoq directly from the engine
 // Returns true if a note on this fret is hit and actively sustaining
@@ -323,6 +330,10 @@ static void (*old_Main_Notes_Add)(void *instance, int32_t num, void *noteChart) 
 static void hook_Main_Notes_Add(void *instance, int32_t num, void *noteChart) {
     if (instance != nullptr) {
         mainNotesInstance = instance;
+        void *special = *(void **)((uintptr_t)instance + 0x88);
+        if (special != nullptr) {
+            mainSpecialInstance = special;
+        }
     }
     if (old_Main_Notes_Add != nullptr) {
         old_Main_Notes_Add(instance, num, noteChart);
@@ -509,6 +520,10 @@ void hook_Main_Notes_byv(void *instance) {
         }
     }
     g_totalAutoHits = 0;
+    g_frozenSpecialSongTime = -1.0f;
+    if (g_freezeSpecial.load()) {
+        applyFreezeSpecialState(true);
+    }
 
     if (old_Main_Notes_byv != nullptr) {
         old_Main_Notes_byv(instance);
@@ -680,6 +695,18 @@ void hook_Main_Update(void *instance) {
             mainScorerInstance = scorer;
         }
 
+        // Main.special: 0xc0
+        void *special = *(void **)((uintptr_t)instance + 0xc0);
+        if (special != nullptr) {
+            mainSpecialInstance = special;
+        }
+
+        // Main.multiplier: 0xf8
+        void *multiplier = *(void **)((uintptr_t)instance + 0xf8);
+        if (multiplier != nullptr) {
+            mainMultiplierInstance = multiplier;
+        }
+
         // Main.chart: 0x58
         void *chart = *(void **)((uintptr_t)instance + 0x58);
         if (chart != nullptr) {
@@ -734,6 +761,17 @@ void hook_Main_Update(void *instance) {
                     old_Main_Frets_byc(mainFretsInstance, i, false); // Release visual fret cleanly!
                 }
             }
+        }
+    }
+
+    // Continually ensure Freeze Special & x8 multiplier lock during active gameplay
+    if (g_freezeSpecial.load()) {
+        if (mainSpecialInstance != nullptr) {
+            *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = true; // active
+            *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true; // spShow
+        }
+        if (mainMultiplierInstance != nullptr) {
+            applyFreezeSpecialState(true);
         }
     }
 }
@@ -835,6 +873,199 @@ void hook_MenuMus_Setlist_cno(void *setlist, int32_t a, bool b) {
     }
 }
 
+// =========================================================================
+// Freeze Special & Permanent x8 Multiplier System (Client-Side)
+// =========================================================================
+
+// Function pointers for Obscured types (lx and lw)
+static void (*lx_set_Value)(void *instance, int32_t value) = nullptr;   // RVA: 0x2116444
+static int32_t (*lx_get_Value)(void *instance) = nullptr;               // RVA: 0x211655c
+static void (*lw_set_Value)(void *instance, float value) = nullptr;     // RVA: 0x2115ed4
+static float (*lw_get_Value)(void *instance) = nullptr;                 // RVA: 0x2115fec
+
+// Function pointer for Main_Special::bzm (Activate Special method)
+static void (*Main_Special_bzm)(void *instance) = nullptr;              // RVA: 0x20bb388
+
+// 16. Hook Main_Special::bzt (RVA: 0x20bb658) - Duration drain / frame timer
+void (*old_Main_Special_bzt)(void *instance, float a) = nullptr;
+void hook_Main_Special_bzt(void *instance, float a) {
+    if (instance != nullptr) {
+        mainSpecialInstance = instance;
+    }
+
+    if (g_freezeSpecial.load() && instance != nullptr) {
+        *(bool *)((uintptr_t)instance + 0x21) = true; // active = true
+        *(bool *)((uintptr_t)instance + 0x20) = true; // spShow = true
+
+        void *eph = *(void **)((uintptr_t)instance + 0x58);
+        if (eph != nullptr && lw_set_Value != nullptr) {
+            lw_set_Value(eph, 100.0f);
+        }
+        void *epi = *(void **)((uintptr_t)instance + 0x60);
+        if (epi != nullptr && lw_set_Value != nullptr) {
+            lw_set_Value(epi, 100.0f);
+        }
+
+        if (g_frozenSpecialSongTime < 0.0f) {
+            g_frozenSpecialSongTime = a;
+        }
+
+        // Pass frozen timestamp to prevent duration decay & expiration
+        if (old_Main_Special_bzt != nullptr) {
+            old_Main_Special_bzt(instance, g_frozenSpecialSongTime);
+        }
+        return;
+    } else {
+        g_frozenSpecialSongTime = -1.0f;
+    }
+
+    if (old_Main_Special_bzt != nullptr) {
+        old_Main_Special_bzt(instance, a);
+    }
+}
+
+// 17. Hook Main_Special::bzv (RVA: 0x20b9708) - Hit note special multiplier check
+bool (*old_Main_Special_bzv)(void *instance, float a) = nullptr;
+bool hook_Main_Special_bzv(void *instance, float a) {
+    if (instance != nullptr) {
+        mainSpecialInstance = instance;
+    }
+    if (g_freezeSpecial.load()) {
+        return true; // Special is permanently active for hit score & multiplier!
+    }
+    if (old_Main_Special_bzv != nullptr) {
+        return old_Main_Special_bzv(instance, a);
+    }
+    return false;
+}
+
+// 18. Hook Main_Special::bzw (RVA: 0x20bb950) - Special active query
+bool (*old_Main_Special_bzw)(void *instance) = nullptr;
+bool hook_Main_Special_bzw(void *instance) {
+    if (instance != nullptr) {
+        mainSpecialInstance = instance;
+    }
+    if (g_freezeSpecial.load()) {
+        return true;
+    }
+    if (old_Main_Special_bzw != nullptr) {
+        return old_Main_Special_bzw(instance);
+    }
+    return false;
+}
+
+// 19. Hook Main_Multiplier::cch (RVA: 0x20c2070) - Multiplier tier & value calculation
+void (*old_Main_Multiplier_cch)(void *instance, int32_t a, bool b) = nullptr;
+void hook_Main_Multiplier_cch(void *instance, int32_t a, bool b) {
+    if (instance != nullptr) {
+        mainMultiplierInstance = instance;
+    }
+
+    if (g_freezeSpecial.load()) {
+        a = 30;     // Combo tier 30+ (4x base)
+        b = true;   // Special active (4x * 2 = 8x)
+    }
+
+    if (old_Main_Multiplier_cch != nullptr) {
+        old_Main_Multiplier_cch(instance, a, b);
+    }
+
+    if (g_freezeSpecial.load() && instance != nullptr) {
+        void *erh = *(void **)((uintptr_t)instance + 0x20);
+        if (erh != nullptr && lx_set_Value != nullptr) {
+            lx_set_Value(erh, 8);
+        }
+        *(int32_t *)((uintptr_t)instance + 0x28) = 8;
+    }
+}
+
+// 20. Hook Main_Multiplier::Special (RVA: 0x20c22e4) - Special visual mode on multiplier
+void (*old_Main_Multiplier_Special)(void *instance, bool on) = nullptr;
+void hook_Main_Multiplier_Special(void *instance, bool on) {
+    if (instance != nullptr) {
+        mainMultiplierInstance = instance;
+    }
+    if (g_freezeSpecial.load()) {
+        on = true; // Always lock special visual ON
+    }
+    if (old_Main_Multiplier_Special != nullptr) {
+        old_Main_Multiplier_Special(instance, on);
+    }
+}
+
+// 21. Hook Main_Multiplier::cci (RVA: 0x20c249c) - Multiplier reset suppressor
+void (*old_Main_Multiplier_cci)(void *instance) = nullptr;
+void hook_Main_Multiplier_cci(void *instance) {
+    if (instance != nullptr) {
+        mainMultiplierInstance = instance;
+    }
+    if (g_freezeSpecial.load()) {
+        if (old_Main_Multiplier_Special != nullptr) {
+            old_Main_Multiplier_Special(instance, true);
+        }
+        if (old_Main_Multiplier_cch != nullptr) {
+            old_Main_Multiplier_cch(instance, 30, true);
+        }
+        return;
+    }
+    if (old_Main_Multiplier_cci != nullptr) {
+        old_Main_Multiplier_cci(instance);
+    }
+}
+
+static void applyFreezeSpecialState(bool enable) {
+    g_freezeSpecial = enable;
+    g_frozenSpecialSongTime = -1.0f;
+    LogDebug("[FreezeSpecial] State changed: %s", enable ? "ENABLED (x8 Locked)" : "DISABLED");
+
+    if (enable) {
+        if (mainSpecialInstance != nullptr) {
+            *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = true; // active
+            *(bool *)((uintptr_t)mainSpecialInstance + 0x20) = true; // spShow
+
+            void *eph = *(void **)((uintptr_t)mainSpecialInstance + 0x58);
+            if (eph != nullptr && lw_set_Value != nullptr) {
+                lw_set_Value(eph, 100.0f);
+            }
+            void *epi = *(void **)((uintptr_t)mainSpecialInstance + 0x60);
+            if (epi != nullptr && lw_set_Value != nullptr) {
+                lw_set_Value(epi, 100.0f);
+            }
+
+            if (Main_Special_bzm != nullptr) {
+                Main_Special_bzm(mainSpecialInstance);
+            }
+        }
+
+        if (mainMultiplierInstance != nullptr) {
+            if (old_Main_Multiplier_Special != nullptr) {
+                old_Main_Multiplier_Special(mainMultiplierInstance, true);
+            }
+            if (old_Main_Multiplier_cch != nullptr) {
+                old_Main_Multiplier_cch(mainMultiplierInstance, 30, true);
+            }
+            void *erh = *(void **)((uintptr_t)mainMultiplierInstance + 0x20);
+            if (erh != nullptr && lx_set_Value != nullptr) {
+                lx_set_Value(erh, 8);
+            }
+            *(int32_t *)((uintptr_t)mainMultiplierInstance + 0x28) = 8;
+        }
+    } else {
+        if (mainSpecialInstance != nullptr) {
+            *(bool *)((uintptr_t)mainSpecialInstance + 0x21) = false;
+        }
+        if (mainMultiplierInstance != nullptr) {
+            if (old_Main_Multiplier_Special != nullptr) {
+                old_Main_Multiplier_Special(mainMultiplierInstance, false);
+            }
+            if (old_Main_Multiplier_cch != nullptr) {
+                int32_t combo = g_currentCombo.load();
+                old_Main_Multiplier_cch(mainMultiplierInstance, combo, false);
+            }
+        }
+    }
+}
+
 // Native Thread for Library Detection & Hooking
 void *hack_thread(void *) {
     LogDebug("=== Guitar Hero Mod Menu Native Thread Started ===");
@@ -933,7 +1164,40 @@ void *hack_thread(void *) {
     ed_Count = reinterpret_cast<int32_t (*)(void *)>(base + 0x1c31f44);
     ed_bad = reinterpret_cast<void *(*)(void *, int32_t)>(base + 0x1c31f14);
 
-    LogDebug("All Guitar Hero Real-Time, Auto Play & Song Unlock hooks installed successfully!");
+    // Resolve Obscured types (lx and lw)
+    lx_set_Value = reinterpret_cast<void (*)(void *, int32_t)>(base + 0x2116444);
+    lx_get_Value = reinterpret_cast<int32_t (*)(void *)>(base + 0x211655c);
+    lw_set_Value = reinterpret_cast<void (*)(void *, float)>(base + 0x2115ed4);
+    lw_get_Value = reinterpret_cast<float (*)(void *)>(base + 0x2115fec);
+
+    // Resolve Main_Special::bzm (Activate Special)
+    Main_Special_bzm = reinterpret_cast<void (*)(void *)>(base + 0x20bb388);
+
+    // 16. Hook Main_Special::bzt (0x20bb658) - Duration drain / frame timer
+    HOOK("0x20bb658", hook_Main_Special_bzt, old_Main_Special_bzt);
+    LogDebug("Hook Main_Special::bzt (0x20bb658): %s", old_Main_Special_bzt != nullptr ? "SUCCESS" : "FAILED");
+
+    // 17. Hook Main_Special::bzv (0x20b9708) - Hit note special multiplier check
+    HOOK("0x20b9708", hook_Main_Special_bzv, old_Main_Special_bzv);
+    LogDebug("Hook Main_Special::bzv (0x20b9708): %s", old_Main_Special_bzv != nullptr ? "SUCCESS" : "FAILED");
+
+    // 18. Hook Main_Special::bzw (0x20bb950) - Special active query
+    HOOK("0x20bb950", hook_Main_Special_bzw, old_Main_Special_bzw);
+    LogDebug("Hook Main_Special::bzw (0x20bb950): %s", old_Main_Special_bzw != nullptr ? "SUCCESS" : "FAILED");
+
+    // 19. Hook Main_Multiplier::cch (0x20c2070) - Multiplier value & tier calculation
+    HOOK("0x20c2070", hook_Main_Multiplier_cch, old_Main_Multiplier_cch);
+    LogDebug("Hook Main_Multiplier::cch (0x20c2070): %s", old_Main_Multiplier_cch != nullptr ? "SUCCESS" : "FAILED");
+
+    // 20. Hook Main_Multiplier::Special (0x20c22e4) - Special visual mode on multiplier
+    HOOK("0x20c22e4", hook_Main_Multiplier_Special, old_Main_Multiplier_Special);
+    LogDebug("Hook Main_Multiplier::Special (0x20c22e4): %s", old_Main_Multiplier_Special != nullptr ? "SUCCESS" : "FAILED");
+
+    // 21. Hook Main_Multiplier::cci (0x20c249c) - Multiplier reset suppressor
+    HOOK("0x20c249c", hook_Main_Multiplier_cci, old_Main_Multiplier_cci);
+    LogDebug("Hook Main_Multiplier::cci (0x20c249c): %s", old_Main_Multiplier_cci != nullptr ? "SUCCESS" : "FAILED");
+
+    LogDebug("All Guitar Hero Real-Time, Auto Play, Song Unlock & Freeze Special hooks installed successfully!");
 
 #else 
     LogDebug("ARM32 architecture not supported for this 64-bit target");
@@ -980,6 +1244,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     const char *features[] = {
             OBFUSCATE("Category_⚡ Automation"),
             OBFUSCATE("10_Toggle_Auto Play"),
+            OBFUSCATE("11_Toggle_Freeze Special"),
 
             OBFUSCATE("Category_🎵 Songs & Unlocks"),
             OBFUSCATE("20_Toggle_Unlock All Songs"),
@@ -992,7 +1257,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1030,6 +1295,13 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             }
             LogDebug("Auto Play toggled: %d", boolean);
             Toast(env, obj, boolean ? OBFUSCATE("⚡ Auto Play: AKTIF") : OBFUSCATE("⚡ Auto Play: NONAKTIF"), ToastLength::LENGTH_SHORT);
+            break;
+
+        // Freeze Special Feature (OFF by default)
+        case 11:
+            applyFreezeSpecialState(boolean);
+            LogDebug("Freeze Special toggled: %d", boolean);
+            Toast(env, obj, boolean ? OBFUSCATE("❄️ Freeze Special: AKTIF (x8 Multiplier)") : OBFUSCATE("❄️ Freeze Special: NONAKTIF"), ToastLength::LENGTH_SHORT);
             break;
 
         // Unlock All Songs Feature (OFF by default)
@@ -1081,8 +1353,9 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
 
             char statsMsg[512];
             snprintf(statsMsg, sizeof(statsMsg),
-                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n📋 Total Notes: %d",
-                     green, red, yellow, blue, orange, hit, autoTotal, combo, miss, total);
+                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n❄️ Special: %s (x8 Multiplier)\n📋 Total Notes: %d",
+                     green, red, yellow, blue, orange, hit, autoTotal, combo, miss,
+                     g_freezeSpecial.load() ? "LOCKED" : "NORMAL", total);
 
             LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, Miss=%d",
                      hit, autoTotal, combo, miss);
