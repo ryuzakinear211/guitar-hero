@@ -183,6 +183,7 @@ struct RecordedRankingScore {
     bool autoPlayUsed = false;
     bool submittedOnline = false;
     std::string recordTime;
+    std::string spSequence;
 };
 
 static RecordedRankingScore g_lastRankingRecord;
@@ -371,6 +372,131 @@ static int32_t CalculateChartMaxScore(void *chartInstance) {
     LogDebug("[ChartMaxScore] Calculated from chart: notes=%d, spNotes=%d, sustainDur=%.2f -> theoreticalMax=%d",
              count, spNotes, totalSustainDuration, theoreticalMax);
     return theoreticalMax;
+}
+
+// Function to compute the optimal Special Power activation route from song chart (ed)
+static std::string CalculateOptimalSpecialHits(void *chartInstance, int32_t topScore, int32_t songBestScore) {
+    if (chartInstance != nullptr && (uintptr_t)chartInstance > 0x10000) {
+        void *dya = *(void **)((uintptr_t)chartInstance + 0x20); // NoteChart[] dya
+        if (dya != nullptr && (uintptr_t)dya > 0x10000) {
+            int32_t count = *(int32_t *)((uintptr_t)dya + 0x18);
+            if (count > 0 && count <= 20000) {
+                struct NoteItem {
+                    float time;
+                    float duration;
+                    int32_t special;
+                };
+
+                std::vector<NoteItem> notes;
+                notes.reserve(count);
+
+                for (int32_t i = 0; i < count; i++) {
+                    void *nc = *(void **)((uintptr_t)dya + 0x20 + i * sizeof(void *));
+                    if (nc == nullptr || (uintptr_t)nc < 0x10000) {
+                        notes.push_back({0.0f, 0.0f, 0});
+                        continue;
+                    }
+                    float t = *(float *)((uintptr_t)nc + 0x14);
+                    float dur = *(float *)((uintptr_t)nc + 0x18);
+                    int32_t sp = *(int32_t *)((uintptr_t)nc + 0x1c);
+                    notes.push_back({t, dur, sp});
+                }
+
+                // Identify SP phrases (continuous sequences of notes where special > 0)
+                std::vector<int32_t> phraseEndIndices;
+                bool inPhrase = false;
+                for (int32_t i = 0; i < count; i++) {
+                    if (notes[i].special > 0) {
+                        inPhrase = true;
+                    } else if (inPhrase) {
+                        phraseEndIndices.push_back(i - 1);
+                        inPhrase = false;
+                    }
+                }
+                if (inPhrase) {
+                    phraseEndIndices.push_back(count - 1);
+                }
+
+                // If chart contains SP phrases, simulate optimal activations
+                if (!phraseEndIndices.empty()) {
+                    std::vector<int32_t> activationHits;
+                    int32_t currentBars = 0;
+                    size_t nextPhraseIdx = 0;
+                    int32_t i = 0;
+
+                    while (i < count) {
+                        // Check if an SP phrase completed at or before this note
+                        while (nextPhraseIdx < phraseEndIndices.size() && phraseEndIndices[nextPhraseIdx] <= i) {
+                            currentBars = std::min(4, currentBars + 1);
+                            nextPhraseIdx++;
+                        }
+
+                        // Activation condition: at least 2 bars (50%) of SP energy
+                        if (currentBars >= 2) {
+                            int32_t limitNote = (nextPhraseIdx < phraseEndIndices.size()) ? phraseEndIndices[nextPhraseIdx] : count - 1;
+
+                            int32_t bestCandidate = i;
+                            float bestScoreYield = -1.0f;
+                            float spDuration = currentBars * 5.0f; // ~5 seconds per bar
+
+                            for (int32_t cand = i; cand <= limitNote && cand < count; cand++) {
+                                float windowEnd = notes[cand].time + spDuration;
+                                float windowYield = 0.0f;
+                                for (int32_t w = cand; w < count && notes[w].time <= windowEnd; w++) {
+                                    windowYield += 20.0f; // Note point multiplier bonus
+                                    if (notes[w].duration > 0.0f) {
+                                        windowYield += notes[w].duration * 25.0f; // Sustain bonus
+                                    }
+                                }
+                                if (windowYield > bestScoreYield) {
+                                    bestScoreYield = windowYield;
+                                    bestCandidate = cand;
+                                }
+                            }
+
+                            int32_t hitNumber = bestCandidate + 1; // 1-indexed hit number
+                            activationHits.push_back(hitNumber);
+
+                            float spEndTime = notes[bestCandidate].time + spDuration;
+                            currentBars = 0;
+                            i = bestCandidate;
+                            while (i < count && notes[i].time < spEndTime) {
+                                i++;
+                            }
+                            continue;
+                        }
+
+                        i++;
+                    }
+
+                    if (!activationHits.empty()) {
+                        std::string routeStr = "";
+                        for (size_t k = 0; k < activationHits.size(); k++) {
+                            if (k > 0) routeStr += "-";
+                            routeStr += std::to_string(activationHits[k]);
+                        }
+                        LogDebug("[SPRoute] Chart optimal route calculated (%zu activations): %s",
+                                 activationHits.size(), routeStr.c_str());
+                        return routeStr;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: estimate based on score or note count
+    int32_t highestScore = std::max(topScore, songBestScore);
+    if (highestScore > 0) {
+        int32_t approxNotes = std::max(120, highestScore / 50);
+        int32_t h1 = (int32_t)(approxNotes * 0.30f);
+        int32_t h2 = (int32_t)(approxNotes * 0.60f);
+        int32_t h3 = (int32_t)(approxNotes * 0.82f);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%d-%d-%d", h1, h2, h3);
+        return std::string(buf);
+    }
+
+    return "230-xxx-xx";
 }
 
 static std::string GetAppPackageName() {
@@ -1899,6 +2025,10 @@ void hook_lk_cxm(void *instance, void *songScoreInfo, bool b) {
             g_lastRankingRecord.autoPlayUsed = g_autoPlay.load();
             g_lastRankingRecord.submittedOnline = true;
             g_lastRankingRecord.recordTime = timeBuf;
+            void *spStr = *(void **)((uintptr_t)songScoreInfo + 0x48);
+            if (spStr != nullptr && (uintptr_t)spStr > 0x10000) {
+                g_lastRankingRecord.spSequence = Il2CppStringToStdString(spStr);
+            }
             g_totalRankingSubmissions++;
         }
 
@@ -2313,7 +2443,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran (100% FC).<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎯 Set Score: Fitur mandiri, kunci score sesuai input target.<br>🏆 Check Ranking: Cek & sinkronkan target score ke All-Time top score (ranking 1) & song best score.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran (100% FC).<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎯 Set Score: Fitur mandiri, kunci score sesuai input target.<br>🏆 Check Ranking: Cek All-Time top score, song best score, & rute optimal special power.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -2470,10 +2600,21 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
                 LogDebug("[TopChartScore] Button 15: No score available yet for Song ID %d", targetSongId);
             }
 
-            char rankingMsg[128];
-            snprintf(rankingMsg, sizeof(rankingMsg), "top score: %d\nsong best score: %d", topScore, songBestScore);
+            // Calculate optimal special power activation route (note hit numbers)
+            std::string specialRoute = CalculateOptimalSpecialHits(g_chartInstance, topScore, songBestScore);
+            {
+                std::lock_guard<std::mutex> lock(g_rankingRecordMutex);
+                if (g_lastRankingRecord.hasData && !g_lastRankingRecord.spSequence.empty() &&
+                    (targetSongId <= 0 || g_lastRankingRecord.songId == targetSongId)) {
+                    specialRoute = g_lastRankingRecord.spSequence;
+                }
+            }
+
+            char rankingMsg[256];
+            snprintf(rankingMsg, sizeof(rankingMsg), "top score: %d\nsong best score: %d\nsepcial hit: %s",
+                     topScore, songBestScore, specialRoute.c_str());
             LogDebug("User clicked Check Ranking Score:\n%s", rankingMsg);
-            Toast(env, obj, rankingMsg, ToastLength::LENGTH_SHORT);
+            Toast(env, obj, rankingMsg, ToastLength::LENGTH_LONG);
             break;
         }
 
