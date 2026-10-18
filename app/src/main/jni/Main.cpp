@@ -14,6 +14,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <ctime>
+#include <string>
+#include <mutex>
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
 #include "Includes/Utils.h"
@@ -155,6 +157,113 @@ static void *mainFretsInstance = nullptr;   // Pointer to Main_Frets
 static void *g_chartInstance = nullptr;     // Pointer to ed (Chart Manager)
 static void *mainSpecialInstance = nullptr; // Pointer to Main_Special
 static void *mainMultiplierInstance = nullptr; // Pointer to Main_Multiplier
+static void *g_gcInstance = nullptr;         // Pointer to gc (GameController / Song List)
+void *(*old_gc_blx)(void *instance, int32_t index) = nullptr; // RVA: 0x1eaa984 - Song getter by index
+int32_t (*gc_bma)(void *instance) = nullptr;  // RVA: 0x1eaa9dc - Song count
+
+// =========================================================================
+// Official Game Ranking Recording & Metadata System
+// =========================================================================
+struct RecordedRankingScore {
+    bool hasData = false;
+    int32_t songId = 0;
+    std::string songTitle;
+    std::string artist;
+    std::string difficulty;
+    int32_t score = 0;
+    int32_t combo = 0;
+    int32_t accuracy = 0;
+    int32_t hits = 0;
+    int32_t misses = 0;
+    int32_t erradas = 0;
+    bool setScoreApplied = false;
+    int32_t targetScore = 0;
+    bool autoPlayUsed = false;
+    bool submittedOnline = false;
+    std::string recordTime;
+};
+
+static RecordedRankingScore g_lastRankingRecord;
+static std::mutex g_rankingRecordMutex;
+static int32_t g_totalRankingSubmissions = 0;
+
+// Active song tracking during gameplay
+static bool g_isSongActive = false;
+static int32_t g_activeSongId = 0;
+static std::string g_activeSongTitle = "";
+static std::string g_activeSongArtist = "";
+static std::string g_activeDifficulty = "Normal";
+
+// Safe conversion from IL2CPP String object to std::string
+static std::string Il2CppStringToStdString(void *il2cppStr) {
+    if (!il2cppStr) return "";
+    uintptr_t ptr = (uintptr_t)il2cppStr;
+    if (ptr < 0x10000 || ptr > 0x7fffffffffULL) return "";
+
+    int32_t length = *(int32_t *)(ptr + 0x10);
+    if (length <= 0 || length > 256) return "";
+
+    const uint16_t *chars = (const uint16_t *)(ptr + 0x14);
+    std::string out;
+    out.reserve(length);
+    for (int32_t i = 0; i < length; i++) {
+        uint16_t c = chars[i];
+        if (c >= 32 && c <= 126) {
+            out.push_back((char)c);
+        } else if (c == 0) {
+            break;
+        } else if (c < 128) {
+            out.push_back((char)c);
+        } else {
+            out.push_back((char)(0xC0 | ((c >> 6) & 0x1F)));
+            out.push_back((char)(0x80 | (c & 0x3F)));
+        }
+    }
+    return out;
+}
+
+static std::string FormatDifficulty(const std::string &rawDif) {
+    if (rawDif.empty()) return "Normal";
+    std::string lower = rawDif;
+    for (char &c : lower) c = (char)tolower((unsigned char)c);
+    if (lower.find("facil") != std::string::npos || lower.find("easy") != std::string::npos) return "Easy";
+    if (lower.find("medio") != std::string::npos || lower.find("med") != std::string::npos) return "Medium";
+    if (lower.find("dificil") != std::string::npos || lower.find("hard") != std::string::npos) return "Hard";
+    if (lower.find("expert") != std::string::npos) return "Expert";
+    return rawDif;
+}
+
+static void LookupSongMeta(int32_t songId, std::string &outTitle, std::string &outArtist) {
+    if (g_gcInstance == nullptr || songId <= 0) return;
+    int32_t count = 0;
+    if (gc_bma != nullptr) {
+        count = gc_bma(g_gcInstance);
+    } else {
+        void *list = *(void **)((uintptr_t)g_gcInstance + 0x20);
+        if (list) count = *(int32_t *)((uintptr_t)list + 0x18);
+    }
+    if (count <= 0 || count > 5000) return;
+
+    for (int i = 0; i < count; i++) {
+        void *song = old_gc_blx != nullptr ? old_gc_blx(g_gcInstance, i) : nullptr;
+        if (song != nullptr) {
+            int32_t id = *(int32_t *)((uintptr_t)song + 0x10);
+            if (id == songId) {
+                void *musicaStr = *(void **)((uintptr_t)song + 0x18);
+                void *bandaStr = *(void **)((uintptr_t)song + 0x20);
+                if (musicaStr) {
+                    std::string t = Il2CppStringToStdString(musicaStr);
+                    if (!t.empty()) outTitle = t;
+                }
+                if (bandaStr) {
+                    std::string a = Il2CppStringToStdString(bandaStr);
+                    if (!a.empty()) outArtist = a;
+                }
+                return;
+            }
+        }
+    }
+}
 
 // Freeze Special Feature State (Single Toggle, OFF by default)
 static std::atomic<bool> g_freezeSpecial{false};
@@ -795,6 +904,26 @@ void hook_Main_Update(void *instance) {
             g_chartInstance = chart;
         }
 
+        // Main.settings: 0x70 (type je : MonoBehaviour)
+        void *settings = *(void **)((uintptr_t)instance + 0x70);
+        if (settings != nullptr && (uintptr_t)settings > 0x10000) {
+            int32_t sId = *(int32_t *)((uintptr_t)settings + 0x20);
+            if (sId > 0 && sId != g_activeSongId) {
+                g_activeSongId = sId;
+                void *difStr = *(void **)((uintptr_t)settings + 0x28);
+                if (difStr) {
+                    g_activeDifficulty = FormatDifficulty(Il2CppStringToStdString(difStr));
+                }
+                std::string title, artist;
+                LookupSongMeta(sId, title, artist);
+                if (!title.empty()) g_activeSongTitle = title;
+                if (!artist.empty()) g_activeSongArtist = artist;
+                g_isSongActive = true;
+                LogDebug("[ActiveSong] Captured from Main.settings: ID=%d, Title='%s', Artist='%s', Diff='%s'",
+                         sId, g_activeSongTitle.c_str(), g_activeSongArtist.c_str(), g_activeDifficulty.c_str());
+            }
+        }
+
         if (!g_mainCapturedLogged && notes != nullptr) {
             g_mainCapturedLogged = true;
             LogDebug("Captured active instances: Main=0x%lx, Frets=0x%lx, Notes=0x%lx, Scorer=0x%lx, Chart=0x%lx",
@@ -917,11 +1046,6 @@ void hook_Main_Sounds_cfe(void *instance) {
 // Song Unlock Feature (Toggle: OFF by default)
 // =========================================================================
 static std::atomic<bool> g_unlockAllSongs{false};
-static void *g_gcInstance = nullptr;
-
-// 11. Hook gc::blx (RVA: 0x1eaa984) - Song getter by index
-void *(*old_gc_blx)(void *instance, int32_t index) = nullptr;
-int32_t (*gc_bma)(void *instance) = nullptr; // RVA: 0x1eaa9dc - Song count
 
 static void UnlockAllSongsInMemory(void *gc) {
     if (!gc) return;
@@ -976,6 +1100,19 @@ void (*old_MenuMus_Setlist_cnn)(void *setlist, int32_t a, bool b) = nullptr;
 void hook_MenuMus_Setlist_cnn(void *setlist, int32_t a, bool b) {
     if (g_unlockAllSongs.load()) {
         b = true; // Mark song as unlocked/owned to bypass purchase dialog
+    }
+    if (g_gcInstance != nullptr && old_gc_blx != nullptr) {
+        void *song = old_gc_blx(g_gcInstance, a);
+        if (song != nullptr) {
+            g_activeSongId = *(int32_t *)((uintptr_t)song + 0x10);
+            void *musicaStr = *(void **)((uintptr_t)song + 0x18);
+            void *bandaStr = *(void **)((uintptr_t)song + 0x20);
+            if (musicaStr) g_activeSongTitle = Il2CppStringToStdString(musicaStr);
+            if (bandaStr) g_activeSongArtist = Il2CppStringToStdString(bandaStr);
+            g_isSongActive = true;
+            LogDebug("[SetlistLaunch] Selected song index %d: ID=%d, Title='%s', Artist='%s'",
+                     a, g_activeSongId, g_activeSongTitle.c_str(), g_activeSongArtist.c_str());
+        }
     }
     if (old_MenuMus_Setlist_cnn != nullptr) {
         old_MenuMus_Setlist_cnn(setlist, a, b);
@@ -1201,6 +1338,7 @@ void hook_Main_ceq(void *instance) {
     if (instance != nullptr) {
         mainInstance = instance;
     }
+    g_isSongActive = false;
 
     if (g_setScoreEnabled.load() && g_targetScore.load() > 0) {
         int32_t target = g_targetScore.load();
@@ -1242,6 +1380,13 @@ void hook_Main_ceq(void *instance) {
 // 23. Hook Main_FinalScreen::bwo (RVA: 0x1f99040) - Final result screen score display
 void (*old_Main_FinalScreen_bwo)(void *instance, void *songTitle, bool b, void *songScoreInfo) = nullptr;
 void hook_Main_FinalScreen_bwo(void *instance, void *songTitle, bool b, void *songScoreInfo) {
+    if (songTitle != nullptr) {
+        std::string t = Il2CppStringToStdString(songTitle);
+        if (!t.empty()) {
+            g_activeSongTitle = t;
+        }
+    }
+
     if (songScoreInfo != nullptr) {
         // Standalone Set Score logic
         if (g_setScoreEnabled.load() && g_targetScore.load() > 0) {
@@ -1401,6 +1546,70 @@ void hook_lk_cxm(void *instance, void *songScoreInfo, bool b) {
 
     if (old_lk_cxm != nullptr) {
         old_lk_cxm(instance, songScoreInfo, b);
+    }
+
+    // Record official ranking submission data
+    if (songScoreInfo != nullptr) {
+        int32_t sId = *(int32_t *)((uintptr_t)songScoreInfo + 0x10);
+        void *difStr = *(void **)((uintptr_t)songScoreInfo + 0x18);
+        std::string dif = difStr ? FormatDifficulty(Il2CppStringToStdString(difStr)) : g_activeDifficulty;
+        if (dif.empty()) dif = "Normal";
+
+        void *pts_lx = *(void **)((uintptr_t)songScoreInfo + 0x20);
+        int32_t finalScore = (pts_lx != nullptr && lx_get_Value != nullptr) ? lx_get_Value(pts_lx) : g_currentScore.load();
+        if (g_setScoreEnabled.load() && g_targetScore.load() > 0) {
+            finalScore = g_targetScore.load();
+        }
+
+        int32_t combo = *(int32_t *)((uintptr_t)songScoreInfo + 0x28);
+        int32_t accuracy = *(int32_t *)((uintptr_t)songScoreInfo + 0x2c);
+        int32_t acertadas = *(int32_t *)((uintptr_t)songScoreInfo + 0x30);
+        int32_t erradas = *(int32_t *)((uintptr_t)songScoreInfo + 0x38);
+        int32_t perdidas = *(int32_t *)((uintptr_t)songScoreInfo + 0x3c);
+
+        std::string title = g_activeSongTitle;
+        std::string artist = g_activeSongArtist;
+        if (title.empty() && sId > 0) {
+            LookupSongMeta(sId, title, artist);
+        }
+        if (title.empty()) {
+            title = "Song #" + std::to_string(sId);
+        }
+
+        time_t now = time(nullptr);
+        char timeBuf[32];
+        struct tm *tm_info = localtime(&now);
+        if (tm_info) {
+            strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", tm_info);
+        } else {
+            snprintf(timeBuf, sizeof(timeBuf), "Baru Saja");
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_rankingRecordMutex);
+            g_lastRankingRecord.hasData = true;
+            g_lastRankingRecord.songId = sId;
+            g_lastRankingRecord.songTitle = title;
+            g_lastRankingRecord.artist = artist;
+            g_lastRankingRecord.difficulty = dif;
+            g_lastRankingRecord.score = finalScore;
+            g_lastRankingRecord.combo = combo;
+            g_lastRankingRecord.accuracy = accuracy;
+            g_lastRankingRecord.hits = acertadas;
+            g_lastRankingRecord.misses = perdidas;
+            g_lastRankingRecord.erradas = erradas;
+            g_lastRankingRecord.setScoreApplied = (g_setScoreEnabled.load() && g_targetScore.load() > 0);
+            g_lastRankingRecord.targetScore = g_targetScore.load();
+            g_lastRankingRecord.autoPlayUsed = g_autoPlay.load();
+            g_lastRankingRecord.submittedOnline = true;
+            g_lastRankingRecord.recordTime = timeBuf;
+            g_totalRankingSubmissions++;
+        }
+
+        LogDebug("[RankingRecord] Recorded official ranking score: Song='%s' (%s), ID=%d, Score=%d, Acc=%d%%, Combo=%d, Hit=%d, Miss=%d, Time=%s",
+                 title.c_str(), dif.c_str(), sId, finalScore, accuracy, combo, acertadas, perdidas, timeBuf);
+
+        g_isSongActive = false;
     }
 
     // Safety net: If Set Score is active, make sure lk_cxn was triggered
@@ -1633,6 +1842,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("12_Toggle_Enable Set Score"),
             OBFUSCATE("13_InputValue_Target Score"),
             OBFUSCATE("14_Button_Reset Target Score"),
+            OBFUSCATE("15_Button_Check Ranking Score (Toast)"),
 
             OBFUSCATE("Category_🎵 Songs & Unlocks"),
             OBFUSCATE("20_Toggle_Unlock All Songs"),
@@ -1645,7 +1855,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran (100% FC).<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎯 Set Score: Fitur mandiri, kunci score sesuai input target.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran (100% FC).<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎯 Set Score: Fitur mandiri, kunci score sesuai input target.<br>🏆 Check Ranking: Cek status score resmi yang tercatat di game ranking.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1729,6 +1939,91 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             g_scoreFrozen = false;
             LogDebug("Target Score reset to 0 by user");
             Toast(env, obj, OBFUSCATE("🎯 Target Score di-reset ke 0!"), ToastLength::LENGTH_SHORT);
+            break;
+        }
+
+        // Button: Check Ranking Score (Toast) (featNum 15)
+        case 15: {
+            char rankingMsg[512];
+            std::lock_guard<std::mutex> lock(g_rankingRecordMutex);
+
+            if (g_lastRankingRecord.hasData) {
+                const char *modeTag = "";
+                if (g_lastRankingRecord.setScoreApplied) {
+                    modeTag = " [TARGET]";
+                } else if (g_lastRankingRecord.autoPlayUsed) {
+                    modeTag = " [100% FC]";
+                }
+
+                if (!g_lastRankingRecord.artist.empty()) {
+                    snprintf(rankingMsg, sizeof(rankingMsg),
+                             "🏆 SCORE RANKING RESMI:\n🎵 Lagu: %s\n🎤 Artis: %s (ID: %d)\n⭐ Diff: %s\n💎 Score: %d%s\n🎯 Akurasi: %d%% | 🔥 Combo: %d\n✅ Hit: %d | ❌ Miss: %d\n📡 Status: ✅ TERCATAT RESMI\n🕒 Waktu: %s (#%d)",
+                             g_lastRankingRecord.songTitle.c_str(),
+                             g_lastRankingRecord.artist.c_str(),
+                             g_lastRankingRecord.songId,
+                             g_lastRankingRecord.difficulty.c_str(),
+                             g_lastRankingRecord.score, modeTag,
+                             g_lastRankingRecord.accuracy,
+                             g_lastRankingRecord.combo,
+                             g_lastRankingRecord.hits,
+                             g_lastRankingRecord.misses,
+                             g_lastRankingRecord.recordTime.c_str(),
+                             g_totalRankingSubmissions);
+                } else {
+                    snprintf(rankingMsg, sizeof(rankingMsg),
+                             "🏆 SCORE RANKING RESMI:\n🎵 Lagu: %s (ID: %d)\n⭐ Diff: %s\n💎 Score: %d%s\n🎯 Akurasi: %d%% | 🔥 Combo: %d\n✅ Hit: %d | ❌ Miss: %d\n📡 Status: ✅ TERCATAT RESMI\n🕒 Waktu: %s (#%d)",
+                             g_lastRankingRecord.songTitle.c_str(),
+                             g_lastRankingRecord.songId,
+                             g_lastRankingRecord.difficulty.c_str(),
+                             g_lastRankingRecord.score, modeTag,
+                             g_lastRankingRecord.accuracy,
+                             g_lastRankingRecord.combo,
+                             g_lastRankingRecord.hits,
+                             g_lastRankingRecord.misses,
+                             g_lastRankingRecord.recordTime.c_str(),
+                             g_totalRankingSubmissions);
+                }
+
+                LogDebug("User clicked Check Ranking Score: Song='%s', ID=%d, Score=%d, Acc=%d%%, Time=%s",
+                         g_lastRankingRecord.songTitle.c_str(),
+                         g_lastRankingRecord.songId,
+                         g_lastRankingRecord.score,
+                         g_lastRankingRecord.accuracy,
+                         g_lastRankingRecord.recordTime.c_str());
+            } else if (g_isSongActive && g_activeSongId > 0) {
+                int32_t liveScore = g_currentScore.load();
+                int32_t targetScore = g_targetScore.load();
+                int32_t liveHit = getNotesHit();
+                int32_t liveCombo = g_currentCombo.load();
+
+                snprintf(rankingMsg, sizeof(rankingMsg),
+                         "🏆 SCORE RANKING (LIVE PLAY):\n🎵 Sedang Main: %s\n⭐ Diff: %s | ID: %d\n💎 Live Score: %d\n🎯 Target Score: %d (%s)\n🔥 Combo: %d | Hit: %d\n⏳ Status: Akan tercatat saat lagu selesai",
+                         g_activeSongTitle.empty() ? "Lagu Aktif" : g_activeSongTitle.c_str(),
+                         g_activeDifficulty.c_str(),
+                         g_activeSongId,
+                         liveScore,
+                         targetScore,
+                         g_setScoreEnabled.load() ? "AKTIF" : "NONAKTIF",
+                         liveCombo, liveHit);
+
+                LogDebug("User clicked Check Ranking Score during active song: ID=%d, Score=%d", g_activeSongId, liveScore);
+            } else {
+                int32_t target = g_targetScore.load();
+                bool setScoreOn = g_setScoreEnabled.load();
+
+                if (setScoreOn && target > 0) {
+                    snprintf(rankingMsg, sizeof(rankingMsg),
+                             "🏆 SCORE RANKING RESMI:\nℹ️ Belum ada score tercatat pada sesi ini.\n🎯 Set Score Siap: Target %d\nMainkan lagu sampai selesai untuk mencatat score resmi ke server ranking!",
+                             target);
+                } else {
+                    snprintf(rankingMsg, sizeof(rankingMsg),
+                             "🏆 SCORE RANKING RESMI:\nℹ️ Belum ada score tercatat pada sesi ini.\nMainkan lagu sampai selesai untuk mencatat score resmi ke server ranking!");
+                }
+
+                LogDebug("User clicked Check Ranking Score: No record yet (SetScore=%d, Target=%d)", setScoreOn ? 1 : 0, target);
+            }
+
+            Toast(env, obj, rankingMsg, ToastLength::LENGTH_LONG);
             break;
         }
 
