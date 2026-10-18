@@ -234,7 +234,7 @@ public class FloatingHUD {
         divider3.setLayoutParams(divParams3);
         mCard.addView(divider3);
 
-        // Row 4: Live Combo
+        // Row 4: Live Combo & Live Score
         LinearLayout row4 = new LinearLayout(mContext);
         row4.setOrientation(LinearLayout.HORIZONTAL);
         row4.setGravity(Gravity.CENTER_VERTICAL);
@@ -246,9 +246,18 @@ public class FloatingHUD {
         tvCombo.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
         tvCombo.setTextColor(Color.parseColor("#ECEFF1"));
         tvCombo.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+
+        tvScore = new TextView(mContext);
+        tvScore.setText(Html.fromHtml("💎 Score: <b><font color='#00E5FF'>0</font></b>"));
+        tvScore.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f);
+        tvScore.setTextColor(Color.parseColor("#ECEFF1"));
+        tvScore.setGravity(Gravity.END);
+        tvScore.setLayoutParams(new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
         row4.addView(tvCombo);
+        row4.addView(tvScore);
         mCard.addView(row4);
 
         mRootView.addView(mCard);
@@ -306,8 +315,16 @@ public class FloatingHUD {
     }
 
     private TextView tvTitle;
+    private TextView tvScore;
     private int pAuto = -1;
     private int pAutoMaster = -1;
+    private int pScore = -1;
+    private int pTarget = -1;
+    private int pFrozen = -1;
+
+    private String formatScore(int s) {
+        return java.text.NumberFormat.getNumberInstance(Locale.US).format(s);
+    }
 
     private void initUpdater() {
         mHandler = new Handler(Looper.getMainLooper());
@@ -329,8 +346,10 @@ public class FloatingHUD {
                             int autoMaster = stats.length >= 10 ? stats[9] : 0;
                             int combo = stats.length >= 11 ? stats[10] : 0;
                             int score = stats.length >= 12 ? stats[11] : 0;
+                            int targetScore = stats.length >= 13 ? stats[12] : 0;
+                            int isFrozen = stats.length >= 14 ? stats[13] : 0;
 
-                            updateCounts(green, red, yellow, blue, orange, total, miss, autoHits, autoMaster, combo, score);
+                            updateCounts(green, red, yellow, blue, orange, total, miss, autoHits, autoMaster, combo, score, targetScore, isFrozen);
                         }
                     } catch (Throwable t) {
                         log("Error updating stats: " + t.getMessage());
@@ -343,12 +362,13 @@ public class FloatingHUD {
     }
 
     public void updateCounts(int green, int red, int yellow, int blue, int orange, int total, int miss, int autoHits, int autoMaster,
-                             int combo, int score) {
+                             int combo, int score, int targetScore, int isFrozen) {
         // Only redraw if any number changed
         if (green == pGreen && red == pRed && yellow == pYellow &&
                 blue == pBlue && orange == pOrange && total == pTotal &&
                 miss == pMiss && autoHits == pAuto && autoMaster == pAutoMaster &&
-                combo == pCombo) {
+                combo == pCombo && score == pScore && targetScore == pTarget &&
+                isFrozen == pFrozen) {
             return;
         }
 
@@ -362,6 +382,9 @@ public class FloatingHUD {
         pAuto = autoHits;
         pAutoMaster = autoMaster;
         pCombo = combo;
+        pScore = score;
+        pTarget = targetScore;
+        pFrozen = isFrozen;
 
         tvGreen.setText("🟢 G: " + green);
         tvRed.setText("🔴 R: " + red);
@@ -379,7 +402,11 @@ public class FloatingHUD {
         }
 
         if (tvTitle != null) {
-            if (autoMaster == 1) {
+            if (targetScore > 0 && isFrozen == 1) {
+                tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font> <font color='#00E676'><small>[FROZEN ❄️]</small></font></b>"));
+            } else if (targetScore > 0) {
+                tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font> <font color='#FFD700'><small>[TARGET 🎯]</small></font></b>"));
+            } else if (autoMaster == 1) {
                 tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font> <font color='#00E676'><small>[AUTO]</small></font></b>"));
             } else {
                 tvTitle.setText(Html.fromHtml("<b><font color='#82CAFD'>⚡ NOTE HUD</font></b>"));
@@ -391,6 +418,21 @@ public class FloatingHUD {
             tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b> <small><font color='#00E676'>(4x)</font></small>"));
         } else {
             tvCombo.setText(Html.fromHtml("🔥 Combo: <b><font color='#FFD700'>" + combo + "</font></b>"));
+        }
+
+        // Live Score display & Target Score indicator
+        if (tvScore != null) {
+            String formattedScore = formatScore(score);
+            if (targetScore > 0) {
+                String formattedTarget = formatScore(targetScore);
+                if (isFrozen == 1) {
+                    tvScore.setText(Html.fromHtml("💎 <b><font color='#00E5FF'>" + formattedScore + "</font></b> <small><font color='#00E676'>[❄️" + formattedTarget + "]</font></small>"));
+                } else {
+                    tvScore.setText(Html.fromHtml("💎 <b><font color='#00E5FF'>" + formattedScore + "</font></b> <small><font color='#FFD700'>(🎯" + formattedTarget + ")</font></small>"));
+                }
+            } else {
+                tvScore.setText(Html.fromHtml("💎 Score: <b><font color='#00E5FF'>" + formattedScore + "</font></b>"));
+            }
         }
 
         int allPlayed = total + miss;

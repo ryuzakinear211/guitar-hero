@@ -127,6 +127,10 @@ static std::atomic<int32_t> g_totalAutoHits{0};
 static std::atomic<int32_t> g_currentCombo{0};
 static std::atomic<int32_t> g_currentScore{0};
 
+// Target Score & Client-Freeze State
+static std::atomic<int32_t> g_targetScore{0};   // 0 = Unlimited Auto Play, > 0 = Target Score mode
+static std::atomic<bool> g_scoreFrozen{false};  // True when score reaches target or is client-frozen
+
 // Pointers to active game instances
 static void *mainInstance = nullptr;        // Pointer to Main (MonoBehaviour)
 static void *mainNotesInstance = nullptr;   // Pointer to Main_Notes
@@ -299,6 +303,7 @@ static void resetAllNoteCounters() {
     g_totalAutoHits = 0;
     g_currentCombo = 0;
     g_currentScore = 0;
+    g_scoreFrozen = false;
 
     if (mainNotesInstance != nullptr) {
         *(int32_t *)((uintptr_t)mainNotesInstance + 0x64) = 0; // acertadas
@@ -325,6 +330,31 @@ static Vector3 (*Transform_get_position)(void *transform) = nullptr;
 static int32_t (*ed_Count)(void *instance) = nullptr;
 static void *(*ed_bad)(void *instance, int32_t a) = nullptr;
 
+// Function pointers for Obscured types (lx and lw)
+static void (*lx_set_Value)(void *instance, int32_t value) = nullptr;   // RVA: 0x2116444
+static int32_t (*lx_get_Value)(void *instance) = nullptr;               // RVA: 0x211655c
+static void (*lw_set_Value)(void *instance, float value) = nullptr;     // RVA: 0x2115ed4
+static float (*lw_get_Value)(void *instance) = nullptr;                 // RVA: 0x2115fec
+
+// Function pointers for Audio inspection (Song Duration)
+static void *(*AudioSource_get_clip)(void *as) = nullptr;               // RVA: 0x3c6f828
+static float (*AudioClip_get_length)(void *clip) = nullptr;             // RVA: 0x3c6e70c
+
+static float getSongDuration() {
+    if (mainInstance == nullptr) return -1.0f;
+    void *songPlayer = *(void **)((uintptr_t)mainInstance + 0x60); // gp at offset 0x60
+    if (songPlayer == nullptr || (uintptr_t)songPlayer < 0x10000) return -1.0f;
+    void *as = *(void **)((uintptr_t)songPlayer + 0x50); // AudioSource at offset 0x50
+    if (as == nullptr || (uintptr_t)as < 0x10000) return -1.0f;
+    if (AudioSource_get_clip != nullptr && AudioClip_get_length != nullptr) {
+        void *clip = AudioSource_get_clip(as);
+        if (clip != nullptr && (uintptr_t)clip > 0x10000) {
+            return AudioClip_get_length(clip);
+        }
+    }
+    return -1.0f;
+}
+
 // Hook Main_Notes::Add (Captures mainNotesInstance)
 static void (*old_Main_Notes_Add)(void *instance, int32_t num, void *noteChart) = nullptr;
 static void hook_Main_Notes_Add(void *instance, int32_t num, void *noteChart) {
@@ -346,6 +376,22 @@ void hook_Main_Scorer_cdc(void *instance, int32_t a, int32_t b) {
     if (instance != nullptr) {
         mainScorerInstance = instance;
     }
+
+    int32_t target = g_targetScore.load();
+    if (target > 0) {
+        if (b >= target || g_scoreFrozen.load()) {
+            b = target;
+            g_scoreFrozen = true;
+            if (mainNotesInstance != nullptr) {
+                void *score_lw = *(void **)((uintptr_t)mainNotesInstance + 0x48);
+                if (score_lw != nullptr && lw_set_Value != nullptr) {
+                    lw_set_Value(score_lw, (float)target);
+                }
+                *(int32_t *)((uintptr_t)mainNotesInstance + 0x50) = target;
+            }
+        }
+    }
+
     g_currentCombo = a;
     g_currentScore = b;
     if (old_Main_Scorer_cdc != nullptr) {
@@ -410,6 +456,23 @@ void hook_Main_Notes_byy(void *instance, void *hm, float b) {
 
     if (old_Main_Notes_byy != nullptr) {
         old_Main_Notes_byy(instance, hm, b);
+    }
+
+    int32_t target = g_targetScore.load();
+    if (target > 0 && mainNotesInstance != nullptr) {
+        void *score_lw = *(void **)((uintptr_t)mainNotesInstance + 0x48);
+        if (score_lw != nullptr && lw_get_Value != nullptr && lw_set_Value != nullptr) {
+            float curScore = lw_get_Value(score_lw);
+            if (curScore >= (float)target || g_scoreFrozen.load()) {
+                lw_set_Value(score_lw, (float)target);
+                *(int32_t *)((uintptr_t)mainNotesInstance + 0x50) = target;
+                g_currentScore = target;
+                g_scoreFrozen = true;
+                if (mainScorerInstance != nullptr && old_Main_Scorer_cdc != nullptr) {
+                    old_Main_Scorer_cdc(mainScorerInstance, g_currentCombo.load(), target);
+                }
+            }
+        }
     }
 
     LogHitThrottled(fret, g_greenHits.load(), g_redHits.load(), g_yellowHits.load(),
@@ -520,8 +583,10 @@ void hook_Main_Notes_byv(void *instance) {
         }
     }
     g_totalAutoHits = 0;
+    g_currentScore = 0;
+    g_scoreFrozen = false;
     g_frozenSpecialSongTime = -1.0f;
-    if (g_freezeSpecial.load()) {
+    if (g_freezeSpecial.load() || (g_targetScore.load() > 0 && g_autoPlay.load())) {
         applyFreezeSpecialState(true);
     }
 
@@ -774,6 +839,39 @@ void hook_Main_Update(void *instance) {
             applyFreezeSpecialState(true);
         }
     }
+
+    // Continually ensure Target Score management & client-side freeze
+    if (g_targetScore.load() > 0) {
+        int32_t target = g_targetScore.load();
+
+        if (g_autoPlay.load() && !g_freezeSpecial.load()) {
+            applyFreezeSpecialState(true);
+        }
+
+        float sTime = 0.0f;
+        if (mainInstance != nullptr) {
+            sTime = *(float *)((uintptr_t)mainInstance + 0x28);
+        }
+        float duration = getSongDuration();
+        bool isSongFinishing = (duration > 0.0f && sTime > 0.0f && sTime >= (duration - 2.0f));
+
+        if (mainNotesInstance != nullptr) {
+            void *score_lw = *(void **)((uintptr_t)mainNotesInstance + 0x48);
+            if (score_lw != nullptr && lw_get_Value != nullptr && lw_set_Value != nullptr) {
+                float curScore = lw_get_Value(score_lw);
+                if (curScore >= (float)target || isSongFinishing) {
+                    lw_set_Value(score_lw, (float)target);
+                    *(int32_t *)((uintptr_t)mainNotesInstance + 0x50) = target;
+                    g_currentScore = target;
+                    g_scoreFrozen = true;
+
+                    if (mainScorerInstance != nullptr && old_Main_Scorer_cdc != nullptr) {
+                        old_Main_Scorer_cdc(mainScorerInstance, g_currentCombo.load(), target);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // 10. Hook Main_Sounds::cfe (RVA: 0x20e267c)
@@ -876,12 +974,6 @@ void hook_MenuMus_Setlist_cno(void *setlist, int32_t a, bool b) {
 // =========================================================================
 // Freeze Special & Permanent x8 Multiplier System (Client-Side)
 // =========================================================================
-
-// Function pointers for Obscured types (lx and lw)
-static void (*lx_set_Value)(void *instance, int32_t value) = nullptr;   // RVA: 0x2116444
-static int32_t (*lx_get_Value)(void *instance) = nullptr;               // RVA: 0x211655c
-static void (*lw_set_Value)(void *instance, float value) = nullptr;     // RVA: 0x2115ed4
-static float (*lw_get_Value)(void *instance) = nullptr;                 // RVA: 0x2115fec
 
 // Function pointer for Main_Special::bzm (Activate Special method)
 static void (*Main_Special_bzm)(void *instance) = nullptr;              // RVA: 0x20bb388
@@ -1066,6 +1158,67 @@ static void applyFreezeSpecialState(bool enable) {
     }
 }
 
+// =========================================================================
+// Target Score & Final Client Freeze System
+// =========================================================================
+
+// 22. Hook Main::ceq (RVA: 0x20c6d70) - Song finish handler (before SongScoreInfo is generated)
+void (*old_Main_ceq)(void *instance) = nullptr;
+void hook_Main_ceq(void *instance) {
+    if (g_targetScore.load() > 0) {
+        int32_t target = g_targetScore.load();
+        if (mainNotesInstance != nullptr) {
+            void *score_lw = *(void **)((uintptr_t)mainNotesInstance + 0x48);
+            if (score_lw != nullptr && lw_set_Value != nullptr) {
+                lw_set_Value(score_lw, (float)target);
+            }
+            *(int32_t *)((uintptr_t)mainNotesInstance + 0x50) = target; // scorePrevious
+        }
+        g_currentScore = target;
+        g_scoreFrozen = true;
+        LogDebug("[TargetScore] Main::ceq invoked, song completed! Score client-frozen to %d", target);
+    }
+    if (old_Main_ceq != nullptr) {
+        old_Main_ceq(instance);
+    }
+}
+
+// 23. Hook Main_FinalScreen::bwo (RVA: 0x1f99040) - Final result screen score display
+void (*old_Main_FinalScreen_bwo)(void *instance, void *songTitle, bool b, void *songScoreInfo) = nullptr;
+void hook_Main_FinalScreen_bwo(void *instance, void *songTitle, bool b, void *songScoreInfo) {
+    if (g_targetScore.load() > 0 && songScoreInfo != nullptr) {
+        int32_t target = g_targetScore.load();
+        void *pts_lx = *(void **)((uintptr_t)songScoreInfo + 0x20);
+        if (pts_lx != nullptr && lx_set_Value != nullptr) {
+            lx_set_Value(pts_lx, target);
+            LogDebug("[TargetScore] Main_FinalScreen::bwo: pts forced to %d", target);
+        }
+        g_currentScore = target;
+        g_scoreFrozen = true;
+    }
+    if (old_Main_FinalScreen_bwo != nullptr) {
+        old_Main_FinalScreen_bwo(instance, songTitle, b, songScoreInfo);
+    }
+}
+
+// 24. Hook jd::cey (RVA: 0x20e18a4) - Score saving handler
+void (*old_jd_cey)(void *instance, void *songScoreInfo, void *finalScreen, bool c) = nullptr;
+void hook_jd_cey(void *instance, void *songScoreInfo, void *finalScreen, bool c) {
+    if (g_targetScore.load() > 0 && songScoreInfo != nullptr) {
+        int32_t target = g_targetScore.load();
+        void *pts_lx = *(void **)((uintptr_t)songScoreInfo + 0x20);
+        if (pts_lx != nullptr && lx_set_Value != nullptr) {
+            lx_set_Value(pts_lx, target);
+            LogDebug("[TargetScore] jd::cey: pts forced to %d", target);
+        }
+        g_currentScore = target;
+        g_scoreFrozen = true;
+    }
+    if (old_jd_cey != nullptr) {
+        old_jd_cey(instance, songScoreInfo, finalScreen, c);
+    }
+}
+
 // Native Thread for Library Detection & Hooking
 void *hack_thread(void *) {
     LogDebug("=== Guitar Hero Mod Menu Native Thread Started ===");
@@ -1197,7 +1350,26 @@ void *hack_thread(void *) {
     HOOK("0x20c249c", hook_Main_Multiplier_cci, old_Main_Multiplier_cci);
     LogDebug("Hook Main_Multiplier::cci (0x20c249c): %s", old_Main_Multiplier_cci != nullptr ? "SUCCESS" : "FAILED");
 
-    LogDebug("All Guitar Hero Real-Time, Auto Play, Song Unlock & Freeze Special hooks installed successfully!");
+    // 22. Hook Main::ceq (0x20c6d70) - Song finish handler
+    HOOK("0x20c6d70", hook_Main_ceq, old_Main_ceq);
+    LogDebug("Hook Main::ceq (0x20c6d70): %s", old_Main_ceq != nullptr ? "SUCCESS" : "FAILED");
+
+    // 23. Hook Main_FinalScreen::bwo (0x1f99040) - Final score screen
+    HOOK("0x1f99040", hook_Main_FinalScreen_bwo, old_Main_FinalScreen_bwo);
+    LogDebug("Hook Main_FinalScreen::bwo (0x1f99040): %s", old_Main_FinalScreen_bwo != nullptr ? "SUCCESS" : "FAILED");
+
+    // 24. Hook jd::cey (0x20e18a4) - Score saving handler
+    HOOK("0x20e18a4", hook_jd_cey, old_jd_cey);
+    LogDebug("Hook jd::cey (0x20e18a4): %s", old_jd_cey != nullptr ? "SUCCESS" : "FAILED");
+
+    // Resolve AudioSource.get_clip & AudioClip.get_length for song duration inspection
+    AudioSource_get_clip = reinterpret_cast<void *(*)(void *)>(base + 0x3c6f828);
+    AudioClip_get_length = reinterpret_cast<float (*)(void *)>(base + 0x3c6e70c);
+    LogDebug("Resolve Audio Duration: get_clip=%s, get_length=%s",
+             AudioSource_get_clip != nullptr ? "OK" : "FAIL",
+             AudioClip_get_length != nullptr ? "OK" : "FAIL");
+
+    LogDebug("All Guitar Hero Real-Time, Auto Play, Target Score, Song Unlock & Freeze Special hooks installed successfully!");
 
 #else 
     LogDebug("ARM32 architecture not supported for this 64-bit target");
@@ -1210,9 +1382,9 @@ void *hack_thread(void *) {
 // JNI Method Implementations
 // =========================================================================
 
-// Returns [green, red, yellow, blue, orange, totalHits, totalMisses, totalCreated, totalAutoHits, autoPlay, currentCombo, currentScore]
+// Returns [green, red, yellow, blue, orange, totalHits, totalMisses, totalCreated, totalAutoHits, autoPlay, currentCombo, currentScore, targetScore, isFrozen]
 jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
-    jintArray result = env->NewIntArray(12);
+    jintArray result = env->NewIntArray(14);
     if (!result) return nullptr;
 
     int32_t totalHits = getNotesHit();
@@ -1220,7 +1392,7 @@ jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
         g_totalAutoHits = totalHits;
     }
 
-    jint fill[12];
+    jint fill[14];
     fill[0] = g_greenHits.load();
     fill[1] = g_redHits.load();
     fill[2] = g_yellowHits.load();
@@ -1233,8 +1405,10 @@ jintArray GetNoteStats(JNIEnv *env, jobject thiz) {
     fill[9] = g_autoPlay.load() ? 1 : 0;
     fill[10] = g_currentCombo.load();
     fill[11] = g_currentScore.load();
+    fill[12] = g_targetScore.load();
+    fill[13] = g_scoreFrozen.load() ? 1 : 0;
 
-    env->SetIntArrayRegion(result, 0, 12, fill);
+    env->SetIntArrayRegion(result, 0, 14, fill);
     return result;
 }
 
@@ -1245,6 +1419,8 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("Category_⚡ Automation"),
             OBFUSCATE("10_Toggle_Auto Play"),
             OBFUSCATE("11_Toggle_Freeze Special"),
+            OBFUSCATE("12_InputValue_Target Score"),
+            OBFUSCATE("13_Button_Clear Target Score (Reset to 0)"),
 
             OBFUSCATE("Category_🎵 Songs & Unlocks"),
             OBFUSCATE("20_Toggle_Unlock All Songs"),
@@ -1257,7 +1433,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("4_Button_Check Debug Log Path"),
 
             OBFUSCATE("Category_HUD & Color Legend"),
-            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
+            OBFUSCATE("RichTextView_🟢 Green (0) | 🔴 Red (1) | 🟡 Yellow (2)<br>🔵 Blue (3) | 🟠 Orange (4)<br><small>⚡ Auto Play: 100% akurat tepat di lingkaran.<br>❄️ Freeze Special: Multiplier terkunci x8 & durasi beku.<br>🎯 Target Score: Auto play sampai target score, client-frozen saat lagu selesai.<br>🎵 Unlock Songs: Buka seluruh lagu & akses VIP.</small>"),
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1303,6 +1479,33 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             LogDebug("Freeze Special toggled: %d", boolean);
             Toast(env, obj, boolean ? OBFUSCATE("❄️ Freeze Special: AKTIF (x8 Multiplier)") : OBFUSCATE("❄️ Freeze Special: NONAKTIF"), ToastLength::LENGTH_SHORT);
             break;
+
+        // Target Score Feature (0 = OFF, >0 = Target Score mode with Freeze Special x8)
+        case 12: {
+            g_targetScore = value;
+            if (value > 0) {
+                g_scoreFrozen = false;
+                applyFreezeSpecialState(true);
+                char targetMsg[128];
+                snprintf(targetMsg, sizeof(targetMsg), "🎯 Target Score: %d (Freeze x8 Aktif)", value);
+                LogDebug("Target Score set: %d", value);
+                Toast(env, obj, targetMsg, ToastLength::LENGTH_SHORT);
+            } else {
+                g_scoreFrozen = false;
+                LogDebug("Target Score disabled");
+                Toast(env, obj, OBFUSCATE("🎯 Target Score: NONAKTIF"), ToastLength::LENGTH_SHORT);
+            }
+            break;
+        }
+
+        // Button: Clear Target Score (Reset to 0)
+        case 13: {
+            g_targetScore = 0;
+            g_scoreFrozen = false;
+            LogDebug("Target Score cleared by user");
+            Toast(env, obj, OBFUSCATE("🎯 Target Score di-reset ke 0 (Nonaktif)!"), ToastLength::LENGTH_SHORT);
+            break;
+        }
 
         // Unlock All Songs Feature (OFF by default)
         case 20:
@@ -1350,15 +1553,19 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             int32_t total = getNotesTotalCreated();
             int32_t autoTotal = g_totalAutoHits.load();
             int32_t combo = g_currentCombo.load();
+            int32_t score = g_currentScore.load();
+            int32_t target = g_targetScore.load();
+            bool frozen = g_scoreFrozen.load();
 
             char statsMsg[512];
             snprintf(statsMsg, sizeof(statsMsg),
-                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n❄️ Special: %s (x8 Multiplier)\n📋 Total Notes: %d",
+                     "LIVE STATS:\n🟢 G:%d 🔴 R:%d 🟡 Y:%d 🔵 B:%d 🟠 O:%d\n🎯 Total Hit: %d | ⚡ Auto Hit: %d\n🔥 Combo: %d | ❌ Miss: %d\n💎 Score: %d %s\n❄️ Special: %s (x8 Multiplier)\n📋 Total Notes: %d",
                      green, red, yellow, blue, orange, hit, autoTotal, combo, miss,
+                     score, target > 0 ? (frozen ? "[FROZEN]" : "[TARGET]") : "",
                      g_freezeSpecial.load() ? "LOCKED" : "NORMAL", total);
 
-            LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, Miss=%d",
-                     hit, autoTotal, combo, miss);
+            LogDebug("User clicked Live Stats: Hit=%d, Auto=%d, Combo=%d, Miss=%d, Score=%d, Target=%d",
+                     hit, autoTotal, combo, miss, score, target);
             Toast(env, obj, statsMsg, ToastLength::LENGTH_LONG);
             break;
         }
