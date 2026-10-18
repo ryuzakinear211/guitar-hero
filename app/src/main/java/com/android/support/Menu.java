@@ -650,8 +650,8 @@ public class Menu {
                         scrollView.removeView(mSettings);
                         scrollView.addView(mods);
                         break;
-                    case 13:
-                        Toast.makeText(v.getContext(), "🎯 Target Score di-reset ke 0 (Nonaktif)", Toast.LENGTH_SHORT).show();
+                    case 14:
+                        Toast.makeText(v.getContext(), "🎯 Target Score di-reset ke 0", Toast.LENGTH_SHORT).show();
                         break;
                     case 4:
                         String logMsg = "Log Debug tersimpan di:\n/sdcard/0/Documents/guitar_hero_debug.log\natau /storage/emulated/0/Documents/";
@@ -773,7 +773,7 @@ public class Menu {
 
         final Button button = new Button(getContext);
         int num = Preferences.loadPrefInt(featName, featNum);
-        String initialDisplay = (featNum == 12 && num == 0) ? "0 (OFF)" : String.valueOf((num == 0 && featNum != 12) ? 1 : num);
+        String initialDisplay = (featNum == 13 && num == 0) ? "0 (OFF)" : String.valueOf((num == 0 && featNum != 13) ? 1 : num);
         button.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + initialDisplay + "</font>"));
         button.setAllCaps(false);
         button.setLayoutParams(layoutParams);
@@ -825,7 +825,7 @@ public class Menu {
                                 num = 2147483640;
                         }
 
-                        String displayVal = (featNum == 12 && num == 0) ? "0 (OFF)" : String.valueOf(num);
+                        String displayVal = (featNum == 13 && num == 0) ? "0 (OFF)" : String.valueOf(num);
                         button.setText(Html.fromHtml(featName + ": <font color='" + NumberTxtColor + "'>" + displayVal + "</font>"));
                         Preferences.changeFeatureInt(featName, featNum, num);
 
